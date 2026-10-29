@@ -24,7 +24,10 @@ $Out = [System.IO.Path]::GetFullPath($Out)
 
 if (Test-Path -LiteralPath $Out) {
     if (-not $Force) { throw "目标已存在：$Out（加 -Force 覆盖）" }
-    Remove-Item -LiteralPath $Out -Recurse -Force
+    # 保留 .git：每次更新源码不该丢掉提交历史
+    Get-ChildItem -LiteralPath $Out -Force |
+        Where-Object { $_.Name -ne '.git' } |
+        ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force }
 }
 New-Item -ItemType Directory -Path $Out -Force | Out-Null
 
@@ -66,7 +69,7 @@ if (Test-Path -LiteralPath $plugSrc) {
             if ($rel -match '(^|\\)(memory|chat_images|logs)\\') { return }
             if ($rel -match '(^|\\)\.(history|pending|trash)\\') { return }
             if ($rel -match '(^|\\)__pycache__(\\|$)') { return }
-            if ($_.Name -match '^(state|groups|chat_history|relationship|daily_state|life_timeline|bot_history|signature_state|qzone_post_state|proactive_state|proactive_overrides|weather_state|policy)\.json$') { return }
+            if ($_.Name -match '^(state|groups|chat_history|chat_images|relationship|daily_state|life_timeline|bot_history|signature_state|qzone_post_state|proactive_state|proactive_overrides|weather_state|policy)\.json$') { return }
             if ($_.Extension -in @('.db', '.log')) { return }
             $target = Join-Path $dest $rel
             $dir = Split-Path $target -Parent
@@ -80,12 +83,19 @@ if (Test-Path -LiteralPath $plugSrc) {
 # 注意：-Include 与 -LiteralPath 同用会被 PowerShell 忽略（会误删全部文件），必须用 Where-Object 过滤
 $pruned = 0
 Get-ChildItem -LiteralPath $Out -Recurse -File -ErrorAction SilentlyContinue |
-    Where-Object { $_.Name -like 'preview*.png' -or $_.Name -like 'preview*.jpg' } |
+    Where-Object { $_.FullName -notmatch '\\\.git\\' -and ($_.Name -like 'preview*.png' -or $_.Name -like 'preview*.jpg') } |
     ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force; $pruned++ }
 if ($pruned -gt 0) { Write-Host "已剔除开发截图 $pruned 张（可能含真实号码）" -ForegroundColor Yellow }
 
+# ---- 3.6 剔除所有表情图片（任何目录下的 stickers\，含 plugins-src 的开发副本）----
+$pruned2 = 0
+Get-ChildItem -LiteralPath $Out -Recurse -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.Extension -in @('.jpg', '.jpeg', '.png', '.gif', '.webp') -and $_.FullName -match '\\stickers\\' } |
+    ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force; $pruned2++ }
+if ($pruned2 -gt 0) { Write-Host "已剔除表情图片 $pruned2 张（版权不明，不公开）" -ForegroundColor Yellow }
+
 # ---- 4. 统计 ----
-$files = Get-ChildItem -LiteralPath $Out -Recurse -Force -File
+$files = Get-ChildItem -LiteralPath $Out -Recurse -Force -File | Where-Object { $_.FullName -notmatch '\\\.git\\' }
 $size = ($files | Measure-Object Length -Sum).Sum
 Write-Host ("导出完成: {0}" -f $Out) -ForegroundColor Green
 Write-Host ("  {0} 个文件 / {1:N1} MB" -f $files.Count, ($size / 1MB))
