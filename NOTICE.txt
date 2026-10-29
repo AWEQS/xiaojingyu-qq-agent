@@ -64,7 +64,7 @@ Chromium 及随附依赖的许可清单：desktop\electron\LICENSES.chromium.htm
                      data\plugins\astrbot_plugin_breeze_tts
   - 脚本             scripts\
 
-对应源码获取方式：【待填：仓库地址，或「发邮件到 xxx@xxx 索取」】
+对应源码获取方式：https://github.com/AWEQS/xiaojingyu-qq-agent
 
 ----------------------------------------------------------------
 7. 本包不包含
