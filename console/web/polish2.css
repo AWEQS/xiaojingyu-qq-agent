@@ -1,0 +1,177 @@
+/* ============================================================
+   高端动效层（大厂质感）
+   ============================================================ */
+:root {
+  --ease-out: cubic-bezier(.16, 1, .3, 1);
+  --ease-spring: cubic-bezier(.2, 1.4, .4, 1);
+}
+
+/* 环境光：缓慢漂浮的极光背景 */
+body::before,
+body::after {
+  content: "";
+  position: fixed;
+  z-index: 0;
+  pointer-events: none;
+  width: 70vw;
+  height: 60vh;
+  filter: blur(90px);
+  opacity: .55;
+  will-change: transform;
+}
+body::before {
+  top: -18vh;
+  left: -12vw;
+  background: radial-gradient(closest-side, rgba(94,224,240,.20), transparent 70%);
+  animation: aurora-a 26s ease-in-out infinite alternate;
+}
+body::after {
+  bottom: -22vh;
+  right: -14vw;
+  background: radial-gradient(closest-side, rgba(255,142,196,.16), transparent 70%);
+  animation: aurora-b 32s ease-in-out infinite alternate;
+}
+@keyframes aurora-a {
+  0%   { transform: translate3d(0,0,0) scale(1); }
+  50%  { transform: translate3d(6vw,4vh,0) scale(1.12); }
+  100% { transform: translate3d(-3vw,7vh,0) scale(.96); }
+}
+@keyframes aurora-b {
+  0%   { transform: translate3d(0,0,0) scale(1); }
+  50%  { transform: translate3d(-5vw,-4vh,0) scale(1.08); }
+  100% { transform: translate3d(4vw,-7vh,0) scale(.94); }
+}
+.sidebar, .main { position: relative; z-index: 1; }
+
+/* 卡片入场：错峰上浮 */
+.panel.active .card,
+.panel.active .behavior-section,
+.panel.active .market-card,
+.panel.active .plugin-card {
+  animation: card-rise .55s var(--ease-out) both;
+}
+.panel.active .card:nth-child(1), .panel.active .behavior-section:nth-child(1) { animation-delay: .02s; }
+.panel.active .card:nth-child(2), .panel.active .behavior-section:nth-child(2) { animation-delay: .06s; }
+.panel.active .card:nth-child(3), .panel.active .behavior-section:nth-child(3) { animation-delay: .10s; }
+.panel.active .card:nth-child(4), .panel.active .behavior-section:nth-child(4) { animation-delay: .14s; }
+.panel.active .card:nth-child(5), .panel.active .behavior-section:nth-child(5) { animation-delay: .18s; }
+.panel.active .card:nth-child(6), .panel.active .behavior-section:nth-child(6) { animation-delay: .22s; }
+.panel.active .card:nth-child(n+7) { animation-delay: .26s; }
+@keyframes card-rise {
+  from { opacity: 0; transform: translateY(14px) scale(.995); filter: blur(2px); }
+  to   { opacity: 1; transform: translateY(0) scale(1); filter: blur(0); }
+}
+
+/* 面板切换 */
+.panel.active { animation: panel-in .34s var(--ease-out); }
+@keyframes panel-in {
+  from { opacity: 0; transform: translateY(10px) scale(.998); filter: blur(3px); }
+  to   { opacity: 1; transform: translateY(0) scale(1); filter: blur(0); }
+}
+
+/* 鼠标跟随光斑 */
+.card,
+.behavior-head,
+.market-card,
+.plugin-card {
+  --mx: 50%;
+  --my: 0%;
+  background-image:
+    radial-gradient(520px circle at var(--mx) var(--my), rgba(94,224,240,.075), transparent 46%),
+    linear-gradient(180deg, rgba(27,34,49,.9), rgba(16,22,33,.94));
+}
+.card:hover,
+.behavior-head:hover,
+.market-card:hover,
+.plugin-card:hover {
+  background-image:
+    radial-gradient(520px circle at var(--mx) var(--my), rgba(94,224,240,.12), transparent 46%),
+    linear-gradient(180deg, rgba(29,37,54,.94), rgba(17,23,35,.96));
+}
+
+/* 主按钮：扫光 + 呼吸光晕 */
+.btn.primary { position: relative; overflow: hidden; isolation: isolate; }
+.btn.primary::after {
+  content: "";
+  position: absolute; inset: 0; z-index: -1;
+  background: linear-gradient(110deg, transparent 25%, rgba(255,255,255,.45) 48%, transparent 62%);
+  transform: translateX(-140%);
+  transition: transform .7s var(--ease-out);
+}
+.btn.primary:hover::after { transform: translateX(140%); }
+.btn.primary:hover {
+  box-shadow: 0 10px 28px rgba(94,224,240,.32), 0 0 0 3px rgba(94,224,240,.10);
+  transform: translateY(-1px) scale(1.01);
+}
+
+/* 状态灯呼吸 */
+.pill.ok::before { animation: breathe-green 2.6s ease-in-out infinite; }
+@keyframes breathe-green {
+  0%, 100% { box-shadow: 0 0 6px rgba(76,224,163,.5); opacity: .85; }
+  50%      { box-shadow: 0 0 16px rgba(76,224,163,1), 0 0 28px rgba(76,224,163,.35); opacity: 1; }
+}
+
+/* 侧边栏：图标弹跳 + 激活条滑动感 */
+.nav-item.active span { animation: icon-pop .42s var(--ease-spring); }
+@keyframes icon-pop {
+  0% { transform: scale(.82); }
+  60% { transform: scale(1.12); }
+  100% { transform: scale(1); }
+}
+.nav-item { transition: background .18s var(--ease-out), color .18s, transform .18s var(--ease-out), border-color .18s; }
+
+/* 数字流光 */
+.stat-big {
+  background: linear-gradient(100deg, #ffffff 10%, #a9e8f4 40%, #ffb8dd 65%, #ffffff 90%);
+  background-size: 220% 100%;
+  -webkit-background-clip: text; background-clip: text; color: transparent;
+  animation: num-shimmer 7s linear infinite;
+}
+@keyframes num-shimmer {
+  0% { background-position: 0% 50%; }
+  100% { background-position: 220% 50%; }
+}
+
+/* 图表柱状入场 */
+.panel.active .usage-bar-fill {
+  transform-origin: bottom center;
+  animation: bar-grow .8s var(--ease-out) both;
+}
+@keyframes bar-grow {
+  from { transform: scaleY(0); opacity: .2; }
+  to   { transform: scaleY(1); opacity: 1; }
+}
+
+/* 弹窗 / toast 动效 */
+.modal-box { animation: modal-pop .34s var(--ease-spring); }
+@keyframes modal-pop {
+  from { opacity: 0; transform: translateY(18px) scale(.96); filter: blur(3px); }
+  to   { opacity: 1; transform: translateY(0) scale(1); filter: blur(0); }
+}
+.toast { animation: toast-in .4s var(--ease-out); }
+@keyframes toast-in {
+  from { opacity: 0; transform: translateX(28px) scale(.98); }
+  to   { opacity: 1; transform: translateX(0) scale(1); }
+}
+
+/* 列表项点击回弹 */
+.btn:active, .nav-item:active, .preset-btn:active { transform: scale(.97); }
+
+/* 设置分区标题细节 */
+.behavior-section .card-head h3::before {
+  content: "";
+  width: 4px; height: 14px; border-radius: 3px;
+  background: linear-gradient(180deg, #6ce9f4, #ff9ccd);
+  box-shadow: 0 0 10px rgba(94,224,240,.35);
+}
+.behavior-section .card-head h3 { gap: 9px; }
+
+/* 尊重系统减弱动效 */
+@media (prefers-reduced-motion: reduce) {
+  body::before, body::after,
+  .panel.active .card, .panel.active .behavior-section, .panel.active .market-card,
+  .panel.active .plugin-card, .stat-big, .pill.ok::before, .modal-box, .toast,
+  .panel.active .usage-bar-fill, .nav-item.active span {
+    animation: none !important;
+  }
+}

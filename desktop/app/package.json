@@ -1,0 +1,8 @@
+{
+  "name": "xiaojingyu-console",
+  "version": "0.1.0",
+  "description": "小鲸鱼 QQ Agent 桌面控制台",
+  "main": "main.js",
+  "author": "dsh-agent",
+  "license": "MIT"
+}

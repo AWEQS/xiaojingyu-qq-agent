@@ -1,0 +1,6 @@
+name: astrbot_plugin_memory_starmap
+display_name: 记忆星图
+desc: 把已审核的星座记忆按话题注入聊天，提供 starmap_recall 工具。
+version: 0.1.0
+author: dsh-agent
+entry: main.py

@@ -1,0 +1,17 @@
+﻿name: member_memory
+display_name: 群友档案记忆
+short_desc: 按群友建档：自动提炼长期事实，下轮对话自然带上
+desc: >-
+  1) 每次回复后在后台调用一次小模型，从群友发言里提炼稳定事实（偏好/身份/雷点/口癖），
+  按 (群号, 群友) 存成 JSON 档案；
+  2) 下轮对话把该群友的档案注入为额外上下文（不破坏系统提示缓存）；
+  3) 去重、限条数、限提炼频率，避免刷 token；
+  4) /memory show 查看自己的档案，/memory clear 清空（管理员）。
+version: 0.2.0
+author: dsh-agent
+astrbot_version: ">=4.0.0"
+tags:
+  - 记忆
+  - 群聊
+  - 档案
+

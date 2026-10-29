@@ -1,0 +1,6 @@
+name: astrbot_plugin_usage_tracker
+display_name: 用量统计
+desc: 记录每次 LLM 调用的 token 用量（含缓存命中），供控制台计算花费和缓存命中率。
+version: 0.1.0
+author: dsh-agent
+entry: main.py

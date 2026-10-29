@@ -1,0 +1,18 @@
+/* 表情包操作按钮：横向对齐 */
+.sticker-grid { grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); }
+.sticker-ops {
+  display: grid !important;
+  grid-template-columns: 1fr 1fr auto;
+  gap: 6px;
+  align-items: center;
+  margin-top: 10px;
+}
+.sticker-ops .btn {
+  height: 28px;
+  padding: 0 6px;
+  font-size: 11px;
+  justify-content: center;
+  white-space: nowrap;
+  min-width: 0;
+}
+.sticker-ops .btn.danger { min-width: 40px; }

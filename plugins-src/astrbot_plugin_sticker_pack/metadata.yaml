@@ -1,0 +1,13 @@
+name: sticker_pack
+display_name: 本地表情包
+short_desc: 给机器人一套本地表情包，模型在回复里用 [sticker:id] 发表情
+desc: >-
+  1) 把 stickers/index.json 里的表情清单注入提示词，模型可以按场景选中；
+  2) 回复里出现 [sticker:<id>] 时，自动拆掉标记并把表情作为图片消息发出；
+  3) 表情库放本地目录，随时往里加图和描述即可扩充。
+version: 0.2.0
+author: dsh-agent
+astrbot_version: ">=4.0.0"
+tags:
+  - 表情包
+  - 群聊

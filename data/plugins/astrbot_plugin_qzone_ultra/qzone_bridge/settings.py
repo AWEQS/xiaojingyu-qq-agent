@@ -1,0 +1,374 @@
+"""Plugin settings."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+
+from .news import normalize_news_scopes
+
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/122.0.0.0 Safari/537.36"
+)
+DEFAULT_LIFE_PUBLISH_IMAGE_RETRY_COUNT = 1
+
+
+def _as_mapping(config: Any) -> dict[str, Any]:
+    if config is None:
+        return {}
+    if isinstance(config, dict):
+        return dict(config)
+    if hasattr(config, "items"):
+        try:
+            return dict(config.items())
+        except Exception:
+            pass
+    if hasattr(config, "model_dump"):
+        try:
+            return dict(config.model_dump())
+        except Exception:
+            pass
+    if hasattr(config, "__dict__"):
+        return {k: v for k, v in vars(config).items() if not k.startswith("_")}
+    return {}
+
+
+def _pick(mapping: dict[str, Any], key: str, default: Any) -> Any:
+    if key in mapping:
+        return mapping[key]
+    nested = mapping.get("qzone")
+    if isinstance(nested, dict) and key in nested:
+        return nested[key]
+    return default
+
+
+def _nested(mapping: dict[str, Any], section: str, key: str, default: Any) -> Any:
+    section_value = mapping.get(section)
+    if isinstance(section_value, dict) and key in section_value:
+        return section_value[key]
+    nested = mapping.get("qzone")
+    if isinstance(nested, dict):
+        section_value = nested.get(section)
+        if isinstance(section_value, dict) and key in section_value:
+            return section_value[key]
+    return default
+
+
+def _as_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    return [value]
+
+
+def _as_bool(value: Any, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"1", "true", "yes", "y", "on"}:
+            return True
+        if text in {"0", "false", "no", "n", "off"}:
+            return False
+    return bool(value)
+
+
+def _choice(value: Any, default: str, allowed: set[str]) -> str:
+    text = str(value or "").strip().lower()
+    return text if text in allowed else default
+
+
+def _as_int(value: Any, default: int, *, minimum: int | None = None, maximum: int | None = None) -> int:
+    try:
+        if isinstance(value, bool):
+            number = int(value)
+        elif isinstance(value, (int, float)):
+            number = int(value)
+        else:
+            text = str(value).strip()
+            number = int(float(text)) if "." in text else int(text)
+    except (TypeError, ValueError, OverflowError):
+        number = int(default)
+    if minimum is not None:
+        number = max(int(minimum), number)
+    if maximum is not None:
+        number = min(int(maximum), number)
+    return number
+
+
+def _as_float(value: Any, default: float, *, minimum: float | None = None, maximum: float | None = None) -> float:
+    try:
+        if isinstance(value, bool):
+            number = float(value)
+        else:
+            number = float(str(value).strip())
+    except (TypeError, ValueError, OverflowError):
+        number = float(default)
+    if minimum is not None:
+        number = max(float(minimum), number)
+    if maximum is not None:
+        number = min(float(maximum), number)
+    return number
+
+
+@dataclass(slots=True)
+class PluginSettings:
+    daemon_port: int = 18999
+    keepalive_interval: int = 120
+    request_timeout: float = 15.0
+    start_timeout: float = 20.0
+    public_feed_limit: int = 5
+    max_feed_limit: int = 20
+    auto_start_daemon: bool = True
+    auto_bind_cookie: bool = True
+    cookie_domain: str = "user.qzone.qq.com"
+    admin_uins: list[int] = field(default_factory=list)
+    user_agent: str = DEFAULT_USER_AGENT
+    render_publish_result: bool = True
+    render_result_width: int = 900
+    render_feed_card_limit: int = 5
+    render_remote_timeout: float = 0.35
+    native_video_publish: bool = True
+    manage_group: int = 0
+    pillowmd_style_dir: str = ""
+    post_provider_id: str = ""
+    post_prompt: str = "找出一个你感兴趣的主题来写一段适合 QQ 空间的说说，简短、有个性、不要解释。"
+    comment_provider_id: str = ""
+    comment_prompt: str = "生成一句简短、直接、贴题的评论，不要解释。"
+    comment_pipeline_enabled: bool = True
+    comment_judgment_provider_id: str = ""
+    comment_reasoning_provider_id: str = ""
+    comment_execution_provider_id: str = ""
+    comment_skip_checkins: bool = True
+    comment_max_length: int = 60
+    reply_provider_id: str = ""
+    reply_prompt: str = "这条帖子收到了一条评论，请自然回复此条评论，不要解释。"
+    news_provider_id: str = ""
+    news_prompt: str = (
+        "从候选新闻中选一条你觉得适合发 QQ 空间的话题，写一段原创短评。"
+        "不要直接复制新闻标题，不要贴链接，不要编造标题之外的细节，简短、有观点、像自然说说。"
+    )
+    ignore_groups: list[str] = field(default_factory=list)
+    ignore_users: list[str] = field(default_factory=list)
+    post_max_msg: int = 500
+    publish_cron: str = ""
+    publish_offset: int = 0
+    news_cron: str = ""
+    news_offset: int = 0
+    comment_cron: str = ""
+    comment_offset: int = 0
+    comment_latest_count: int = 1
+    read_prob: float = 0.0
+    send_admin: bool = False
+    like_when_comment: bool = False
+    life_publish_enabled: bool = False
+    life_publish_use_life_context: bool = True
+    life_publish_use_llm_image_prompt: bool = True
+    life_publish_use_omnidraw_selfie: bool = True
+    life_publish_auto_caption: bool = True
+    life_publish_mode: str = "publish"
+    life_publish_failure_policy: str = "skip"
+    life_publish_aspect_ratio: str = "1:1"
+    life_publish_size: str = ""
+    life_publish_extra_params: str = ""
+    life_publish_image_retry_count: int = DEFAULT_LIFE_PUBLISH_IMAGE_RETRY_COUNT
+    life_publish_static_caption: str = "今日份生活碎片。"
+    life_publish_image_prompt_template: str = (
+        "根据今日日程和穿搭，写一段适合 OmniDraw 自拍模式的生图提示词。"
+        "画面要像真实手机自拍或日常随手拍，包含场景、动作、服装、光线和氛围。\n\n"
+        "{life_context}"
+    )
+    life_publish_caption_prompt: str = (
+        "根据今日日程和自拍画面，写一条适合 QQ 空间发布的简短说说。"
+        "自然、有生活感，不要解释。\n\n"
+        "日程上下文：\n{life_context}\n\n"
+        "自拍提示词：\n{image_prompt}"
+    )
+    news_scopes: list[str] = field(default_factory=lambda: ["china"])
+    news_keywords: list[str] = field(default_factory=list)
+    news_custom_rss_urls: list[str] = field(default_factory=list)
+    news_max_candidates: int = 12
+    news_recency_hours: int = 36
+    news_once_per_day: bool = True
+    news_max_post_length: int = 180
+    news_trust_env: bool = True
+    cookies_str: str = ""
+    show_name: bool = True
+
+    @classmethod
+    def from_mapping(cls, config: Any) -> "PluginSettings":
+        mapping = _as_mapping(config)
+        admin_uins = _pick(mapping, "admin_uins", [])
+        if not admin_uins:
+            admin_uins = _pick(mapping, "admins_id", [])
+        if isinstance(admin_uins, str):
+            admin_uins = [int(item.strip()) for item in admin_uins.split(",") if item.strip().isdigit()]
+        if not isinstance(admin_uins, list):
+            admin_uins = []
+        timeout = _pick(mapping, "timeout", None)
+        return cls(
+            daemon_port=_as_int(_pick(mapping, "daemon_port", 18999), 18999, minimum=1, maximum=65535),
+            keepalive_interval=_as_int(_pick(mapping, "keepalive_interval", 120), 120, minimum=1),
+            request_timeout=_as_float(
+                _pick(mapping, "request_timeout", timeout if timeout is not None else 15.0),
+                15.0,
+                minimum=0.1,
+            ),
+            start_timeout=_as_float(_pick(mapping, "start_timeout", 20.0), 20.0, minimum=0.1),
+            public_feed_limit=_as_int(_pick(mapping, "public_feed_limit", 5), 5, minimum=1),
+            max_feed_limit=_as_int(_pick(mapping, "max_feed_limit", 20), 20, minimum=1),
+            auto_start_daemon=_as_bool(_pick(mapping, "auto_start_daemon", True), True),
+            auto_bind_cookie=_as_bool(_pick(mapping, "auto_bind_cookie", True), True),
+            cookie_domain=str(_pick(mapping, "cookie_domain", "user.qzone.qq.com") or "user.qzone.qq.com").strip()
+            or "user.qzone.qq.com",
+            admin_uins=[int(v) for v in admin_uins if str(v).isdigit()],
+            user_agent=str(_pick(mapping, "user_agent", DEFAULT_USER_AGENT) or DEFAULT_USER_AGENT),
+            render_publish_result=_as_bool(_pick(mapping, "render_publish_result", True), True),
+            render_result_width=_as_int(_pick(mapping, "render_result_width", 900), 900, minimum=320, maximum=2400),
+            render_feed_card_limit=_as_int(_pick(mapping, "render_feed_card_limit", 5), 5, minimum=1),
+            render_remote_timeout=_as_float(_pick(mapping, "render_remote_timeout", 0.35), 0.35, minimum=0.05),
+            native_video_publish=_as_bool(_pick(mapping, "native_video_publish", True), True),
+            manage_group=_as_int(_pick(mapping, "manage_group", 0), 0, minimum=0),
+            pillowmd_style_dir=str(_pick(mapping, "pillowmd_style_dir", "") or ""),
+            post_provider_id=str(_nested(mapping, "llm", "post_provider_id", "") or ""),
+            post_prompt=str(_nested(mapping, "llm", "post_prompt", cls.post_prompt) or cls.post_prompt),
+            comment_provider_id=str(_nested(mapping, "llm", "comment_provider_id", "") or ""),
+            comment_prompt=str(_nested(mapping, "llm", "comment_prompt", cls.comment_prompt) or cls.comment_prompt),
+            comment_pipeline_enabled=_as_bool(_nested(mapping, "llm", "comment_pipeline_enabled", True), True),
+            comment_judgment_provider_id=str(_nested(mapping, "llm", "comment_judgment_provider_id", "") or ""),
+            comment_reasoning_provider_id=str(_nested(mapping, "llm", "comment_reasoning_provider_id", "") or ""),
+            comment_execution_provider_id=str(_nested(mapping, "llm", "comment_execution_provider_id", "") or ""),
+            comment_skip_checkins=_as_bool(_nested(mapping, "llm", "comment_skip_checkins", True), True),
+            comment_max_length=_as_int(_nested(mapping, "llm", "comment_max_length", 60), 60, minimum=1),
+            reply_provider_id=str(_nested(mapping, "llm", "reply_provider_id", "") or ""),
+            reply_prompt=str(_nested(mapping, "llm", "reply_prompt", cls.reply_prompt) or cls.reply_prompt),
+            news_provider_id=str(
+                _nested(
+                    mapping,
+                    "llm",
+                    "news_provider_id",
+                    _nested(mapping, "llm", "post_provider_id", ""),
+                )
+                or ""
+            ),
+            news_prompt=str(_nested(mapping, "llm", "news_prompt", cls.news_prompt) or cls.news_prompt),
+            ignore_groups=[str(item) for item in _as_list(_nested(mapping, "source", "ignore_groups", []))],
+            ignore_users=[str(item) for item in _as_list(_nested(mapping, "source", "ignore_users", []))],
+            post_max_msg=_as_int(_nested(mapping, "source", "post_max_msg", 500), 500, minimum=1),
+            publish_cron=str(_nested(mapping, "trigger", "publish_cron", "") or ""),
+            publish_offset=_as_int(
+                _nested(
+                    mapping,
+                    "trigger",
+                    "publish_offset",
+                    _nested(mapping, "trigger", "publish_offset_minutes", 0),
+                ),
+                0,
+                minimum=0,
+            ),
+            news_cron=str(_nested(mapping, "trigger", "news_cron", "") or ""),
+            news_offset=_as_int(
+                _nested(
+                    mapping,
+                    "trigger",
+                    "news_offset",
+                    _nested(mapping, "trigger", "news_offset_minutes", 0),
+                ),
+                0,
+                minimum=0,
+            ),
+            comment_cron=str(_nested(mapping, "trigger", "comment_cron", "") or ""),
+            comment_offset=_as_int(
+                _nested(
+                    mapping,
+                    "trigger",
+                    "comment_offset",
+                    _nested(mapping, "trigger", "comment_offset_minutes", 0),
+                ),
+                0,
+                minimum=0,
+            ),
+            comment_latest_count=_as_int(_nested(mapping, "trigger", "comment_latest_count", 1), 1, minimum=1),
+            read_prob=_as_float(_nested(mapping, "trigger", "read_prob", 0.0), 0.0, minimum=0.0, maximum=1.0),
+            send_admin=_as_bool(_nested(mapping, "trigger", "send_admin", False), False),
+            like_when_comment=_as_bool(_nested(mapping, "trigger", "like_when_comment", False), False),
+            life_publish_enabled=_as_bool(_nested(mapping, "life_publish", "enabled", False), False),
+            life_publish_use_life_context=_as_bool(
+                _nested(mapping, "life_publish", "use_life_context", True),
+                True,
+            ),
+            life_publish_use_llm_image_prompt=_as_bool(
+                _nested(mapping, "life_publish", "use_llm_image_prompt", True),
+                True,
+            ),
+            life_publish_use_omnidraw_selfie=_as_bool(
+                _nested(mapping, "life_publish", "use_omnidraw_selfie", True),
+                True,
+            ),
+            life_publish_auto_caption=_as_bool(
+                _nested(mapping, "life_publish", "auto_caption", True),
+                True,
+            ),
+            life_publish_mode=_choice(
+                _nested(mapping, "life_publish", "mode", "publish"),
+                "publish",
+                {"publish", "draft"},
+            ),
+            life_publish_failure_policy=_choice(
+                _nested(mapping, "life_publish", "failure_policy", "skip"),
+                "skip",
+                {"skip", "text_only"},
+            ),
+            life_publish_aspect_ratio=str(_nested(mapping, "life_publish", "aspect_ratio", "1:1") or "1:1"),
+            life_publish_size=str(_nested(mapping, "life_publish", "size", "") or ""),
+            life_publish_extra_params=str(_nested(mapping, "life_publish", "extra_params", "") or ""),
+            life_publish_image_retry_count=_as_int(
+                _nested(
+                    mapping,
+                    "life_publish",
+                    "image_retry_count",
+                    DEFAULT_LIFE_PUBLISH_IMAGE_RETRY_COUNT,
+                ),
+                DEFAULT_LIFE_PUBLISH_IMAGE_RETRY_COUNT,
+                minimum=0,
+                maximum=5,
+            ),
+            life_publish_static_caption=str(
+                _nested(mapping, "life_publish", "static_caption", cls.life_publish_static_caption)
+                or cls.life_publish_static_caption
+            ),
+            life_publish_image_prompt_template=str(
+                _nested(
+                    mapping,
+                    "life_publish",
+                    "image_prompt_template",
+                    cls.life_publish_image_prompt_template,
+                )
+                or cls.life_publish_image_prompt_template
+            ),
+            life_publish_caption_prompt=str(
+                _nested(mapping, "life_publish", "caption_prompt", cls.life_publish_caption_prompt)
+                or cls.life_publish_caption_prompt
+            ),
+            news_scopes=normalize_news_scopes(_nested(mapping, "news", "scopes", ["china"])),
+            news_keywords=[str(item).strip() for item in _as_list(_nested(mapping, "news", "keywords", [])) if str(item).strip()],
+            news_custom_rss_urls=[
+                str(item).strip() for item in _as_list(_nested(mapping, "news", "custom_rss_urls", [])) if str(item).strip()
+            ],
+            news_max_candidates=_as_int(_nested(mapping, "news", "max_candidates", 12), 12, minimum=1),
+            news_recency_hours=_as_int(_nested(mapping, "news", "recency_hours", 36), 36, minimum=0),
+            news_once_per_day=_as_bool(_nested(mapping, "news", "once_per_day", True), True),
+            news_max_post_length=_as_int(_nested(mapping, "news", "max_post_length", 180), 180, minimum=40),
+            news_trust_env=_as_bool(_nested(mapping, "news", "trust_env", True), True),
+            cookies_str=str(_pick(mapping, "cookies_str", "") or ""),
+            show_name=_as_bool(_pick(mapping, "show_name", True), True),
+        )

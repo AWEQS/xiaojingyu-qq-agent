@@ -1,0 +1,6 @@
+name: astrbot_plugin_memory_diary
+display_name: 聊天日记
+desc: 每天写一页聊天日记，按线索检索；只在聊到过去时注入一小段。与 Angel 长期记忆并行。
+version: 0.1.0
+author: dsh-agent
+entry: main.py

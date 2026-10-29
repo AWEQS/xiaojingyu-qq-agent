@@ -1,0 +1,93 @@
+小鲸鱼 QQ Agent — 第三方组件与许可声明
+================================================================
+
+本发行包包含下列第三方组件。分发或使用本包，即表示你遵守各组件各自的许可证。
+
+----------------------------------------------------------------
+1. AstrBot 4.29.3 — AGPL-3.0-or-later
+----------------------------------------------------------------
+上游项目：https://github.com/AstrBotDevs/AstrBot
+许可证全文：tools\astrbot\Lib\site-packages\LICENSE
+
+本包内含 AstrBot 的可执行代码，未修改其核心源码。
+按 AGPL-3.0 的要求，取得对应源码的方式：
+  - 上游：上述 GitHub 仓库（版本 4.29.3）
+  - 本项目对 AstrBot 的任何本地改动：见第 6 节
+
+----------------------------------------------------------------
+2. Electron 40.0.0 — MIT
+----------------------------------------------------------------
+许可证：desktop\electron\LICENSE
+Chromium 及随附依赖的许可清单：desktop\electron\LICENSES.chromium.html
+
+----------------------------------------------------------------
+3. Python 3.12.16 — PSF License Agreement
+----------------------------------------------------------------
+许可证：python\cpython-3.12.16-windows-x86_64-none\LICENSE.txt
+
+----------------------------------------------------------------
+4. FFmpeg 7.1 — GPLv3（gyan.dev essentials build）
+----------------------------------------------------------------
+以独立可执行文件 bin\ffmpeg.exe 调用（语音转换用），未与本程序静态链接。
+源码：https://ffmpeg.org/download.html
+构建方：https://www.gyan.dev/ffmpeg/builds/
+许可证全文随系统分发的 FFmpeg 文档提供；如需副本请索取。
+
+----------------------------------------------------------------
+5. 第三方 AstrBot 插件
+----------------------------------------------------------------
+- astrbot_plugin_angel_memory — GPLv3
+  作者 kawayiYokami
+  https://github.com/kawayiYokami/astrbot_plugin_angel_memory
+  注意：本项目对其做过本地修改（记忆整理时间 04:00 → 22:00），改动记录见 docs\angel-memory-patch.md
+
+- astrbot_plugin_qzone_ultra — MIT
+  作者 雪碧bir
+  https://github.com/diaomin66/astrbot_plugin_qzone_ultra
+  许可证全文：data\plugins\astrbot_plugin_qzone_ultra\LICENSE
+
+----------------------------------------------------------------
+6. 本项目自有代码 — AGPL-3.0-or-later
+----------------------------------------------------------------
+以下部分由本项目作者编写，以 AGPL-3.0-or-later 授权发布，
+以符合 AstrBot（AGPL）对衍生作品分发的要求：
+
+  - 控制台           console\
+  - 桌面壳           desktop\app\
+  - 自研插件         data\plugins\astrbot_plugin_persona_pack
+                     data\plugins\astrbot_plugin_whale_behavior
+                     data\plugins\astrbot_plugin_member_memory
+                     data\plugins\astrbot_plugin_sticker_pack
+                     data\plugins\astrbot_plugin_memory_diary
+                     data\plugins\astrbot_plugin_memory_starmap
+                     data\plugins\astrbot_plugin_usage_tracker
+                     data\plugins\astrbot_plugin_breeze_tts
+  - 脚本             scripts\
+
+对应源码获取方式：【待填：仓库地址，或「发邮件到 xxx@xxx 索取」】
+
+----------------------------------------------------------------
+7. 本包不包含
+----------------------------------------------------------------
+- NapCat / 腾讯 QQ 客户端
+  协议端需用户自行安装，见 scripts\install-napcat.ps1。腾讯 QQ 客户端版权归腾讯所有，
+  本项目不随包分发。
+
+- 第三方表情包
+  出厂表情库为空（data\plugins\astrbot_plugin_sticker_pack\stickers\ 下只有空
+  index.json 和说明）。网络上流传的梗图多为版权不明的二次传播，随包分发属于
+  再发行，有法律风险，故不预置。
+
+----------------------------------------------------------------
+8. 用户自行导入的素材
+----------------------------------------------------------------
+使用者通过控制台上传的表情包、图片、语音等素材，其版权与合规责任由导入者承担，
+本项目不代为审查。
+
+----------------------------------------------------------------
+9. 再分发
+----------------------------------------------------------------
+若你分发本包的修改版，请：
+  - 保留本文件
+  - 同样以 AGPL-3.0-or-later 提供你的修改
+  - 提供对应的完整源码

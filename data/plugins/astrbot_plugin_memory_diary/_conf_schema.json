@@ -1,0 +1,42 @@
+{
+  "enabled": {
+    "type": "bool",
+    "default": true,
+    "description": "启用聊天日记"
+  },
+  "diary_hour": {
+    "type": "int",
+    "default": 23,
+    "description": "每天写日记的小时（0-23）"
+  },
+  "diary_minute": {
+    "type": "int",
+    "default": 30,
+    "description": "每天写日记的分钟（0-59）"
+  },
+  "keep_days": {
+    "type": "int",
+    "default": 30,
+    "description": "日记保留天数"
+  },
+  "max_page_chars": {
+    "type": "int",
+    "default": 400,
+    "description": "每页日记目标字数"
+  },
+  "cue_inject_chars": {
+    "type": "int",
+    "default": 450,
+    "description": "聊到过去时最多注入多少字"
+  },
+  "min_messages": {
+    "type": "int",
+    "default": 6,
+    "description": "某会话当天至少多少条消息才写日记"
+  },
+  "respect_whitelist": {
+    "type": "bool",
+    "default": true,
+    "description": "只记录白名单会话的消息"
+  }
+}

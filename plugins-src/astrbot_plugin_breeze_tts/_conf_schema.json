@@ -1,0 +1,62 @@
+{
+  "enabled": {
+    "type": "bool",
+    "default": true,
+    "description": "启用语音"
+  },
+  "api_key": {
+    "type": "string",
+    "default": "",
+    "description": "BreezeBlue API Key"
+  },
+  "base_url": {
+    "type": "string",
+    "default": "https://api.breeze.blue",
+    "description": "API 地址"
+  },
+  "model_id": {
+    "type": "string",
+    "default": "breeze-tts-2",
+    "description": "模型 ID"
+  },
+  "voice_id": {
+    "type": "string",
+    "default": "",
+    "description": "当前使用的音色 ID（控制台管理）"
+  },
+  "instructions": {
+    "type": "string",
+    "default": "用轻松、自然的语气说话，像和朋友聊天",
+    "description": "语音指令（情绪/语速/风格）"
+  },
+  "guidance_scale": {
+    "type": "float",
+    "default": 4.0,
+    "description": "指令强度 1-10"
+  },
+  "voice_rate": {
+    "type": "int",
+    "default": 8,
+    "description": "语音概率（%）"
+  },
+  "max_chars": {
+    "type": "int",
+    "default": 20,
+    "description": "只对不超过多少字的回复发语音"
+  },
+  "cooldown_sec": {
+    "type": "int",
+    "default": 300,
+    "description": "同会话冷却（秒）"
+  },
+  "delay_ms": {
+    "type": "int",
+    "default": 800,
+    "description": "语音延迟（毫秒）"
+  },
+  "timeout_sec": {
+    "type": "int",
+    "default": 30,
+    "description": "API 超时（秒）"
+  }
+}

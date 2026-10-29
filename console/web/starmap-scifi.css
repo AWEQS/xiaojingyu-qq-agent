@@ -1,0 +1,78 @@
+/* ---------------- 星图：深空科幻风 ---------------- */
+.sm-canvas-card {
+  position: relative;
+  background:
+    radial-gradient(1200px 600px at 20% 10%, rgba(38, 125, 255, .12), transparent 60%),
+    radial-gradient(900px 500px at 85% 90%, rgba(178, 70, 255, .10), transparent 55%),
+    radial-gradient(600px 380px at 60% 35%, rgba(94, 224, 240, .08), transparent 65%),
+    linear-gradient(180deg, #050812 0%, #03050c 55%, #02040a 100%);
+  border: 1px solid rgba(94, 224, 240, .22);
+  box-shadow:
+    0 0 0 1px rgba(94, 224, 240, .05) inset,
+    0 0 70px rgba(38, 125, 255, .10) inset,
+    0 24px 70px rgba(0, 0, 0, .65);
+  overflow: hidden;
+}
+.sm-canvas-card::before {
+  content: "";
+  position: absolute; inset: 0;
+  background-image:
+    radial-gradient(1px 1px at 12% 22%, rgba(255,255,255,.9), transparent 100%),
+    radial-gradient(1px 1px at 28% 68%, rgba(160,240,255,.8), transparent 100%),
+    radial-gradient(1.4px 1.4px at 46% 18%, rgba(255,255,255,.75), transparent 100%),
+    radial-gradient(1px 1px at 63% 82%, rgba(255,255,255,.7), transparent 100%),
+    radial-gradient(1.6px 1.6px at 78% 34%, rgba(255,160,240,.7), transparent 100%),
+    radial-gradient(1px 1px at 88% 62%, rgba(160,240,255,.8), transparent 100%),
+    radial-gradient(1px 1px at 8% 84%, rgba(255,255,255,.65), transparent 100%),
+    radial-gradient(1.2px 1.2px at 55% 46%, rgba(255,255,255,.6), transparent 100%);
+  background-size: 520px 420px, 460px 380px, 640px 520px, 580px 440px, 700px 560px, 430px 360px, 620px 500px, 760px 620px;
+  opacity: .65;
+  animation: sm-drift 40s linear infinite;
+  pointer-events: none;
+}
+.sm-canvas-card::after {
+  content: "";
+  position: absolute; inset: 0;
+  background:
+    repeating-linear-gradient(0deg, rgba(94,224,240,.035) 0px, rgba(94,224,240,.035) 1px, transparent 1px, transparent 4px),
+    linear-gradient(rgba(94,224,240,.045) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(94,224,240,.045) 1px, transparent 1px);
+  background-size: 100% 4px, 100px 100px, 100px 100px;
+  opacity: .35;
+  mask-image: radial-gradient(ellipse at 50% 50%, rgba(0,0,0,.95), transparent 78%);
+  pointer-events: none;
+}
+@keyframes sm-drift {
+  from { background-position: 0 0, 0 0, 0 0, 0 0, 0 0, 0 0, 0 0, 0 0; }
+  to { background-position: 520px 420px, -460px 380px, 640px -520px, -580px 440px, 700px 560px, -430px 360px, 620px 500px, -760px 620px; }
+}
+.sm-canvas-card .card-head { position: relative; z-index: 3; }
+.sm-canvas-card .card-head h3 { color: #9df3ff; letter-spacing: 4px; text-shadow: 0 0 12px rgba(94,224,240,.45); }
+.sm-canvas-card .card-head .hint { color: #4f6b87; letter-spacing: 1px; }
+#sm-svg { position: relative; z-index: 2; }
+.sm-hud {
+  position: absolute; z-index: 3; pointer-events: none;
+  font-size: 9px; letter-spacing: 2px; color: rgba(94,224,240,.55);
+  font-family: "Cascadia Code", Consolas, monospace; text-transform: uppercase;
+}
+.sm-hud-tl { left: 18px; top: 54px; }
+.sm-hud-tr { right: 18px; bottom: 54px; text-align: right; }
+.sm-hud-bl { left: 18px; bottom: 54px; }
+.sm-hud::before, .sm-hud::after { content: ""; position: absolute; width: 18px; height: 18px; border: 1px solid rgba(94,224,240,.35); }
+.sm-hud-tl::before { left: -10px; top: -10px; border-right: 0; border-bottom: 0; }
+.sm-hud-tl::after { left: 40px; top: -10px; width: 70px; border-left: 0; border-right: 0; border-bottom: 0; }
+.sm-hud-tr::before { right: -10px; bottom: -10px; border-left: 0; border-top: 0; }
+.sm-hud-bl::before { left: -10px; bottom: -10px; border-right: 0; border-top: 0; }
+#sm-svg .sm-link { stroke: rgba(94,224,240,.22); stroke-width: .8; stroke-dasharray: 2 6; animation: sm-flow 18s linear infinite; }
+@keyframes sm-flow { to { stroke-dashoffset: -120; } }
+#sm-svg .sm-node circle { stroke: rgba(255,255,255,.45); stroke-width: .7; }
+#sm-svg .sm-node .sm-orbit { fill: none; stroke: rgba(94,224,240,.20); stroke-width: .7; stroke-dasharray: 1 5; }
+#sm-svg .sm-label { fill: #9ec9de; font-size: 9px; letter-spacing: .5px; text-shadow: 0 0 6px rgba(94,224,240,.35); }
+#sm-svg .sm-const-label { fill: rgba(94,224,240,.32); font-family: "Cascadia Code", Consolas, monospace; letter-spacing: 5px; }
+#sm-svg .sm-star { fill: #dff9ff; opacity: .55; }
+#sm-svg .sm-scan { stroke: rgba(94,224,240,.18); stroke-width: .6; }
+.sm-legend { position: relative; z-index: 3; border-top: 1px solid rgba(94,224,240,.08); padding-top: 10px; }
+.sm-legend span { color: #5f7d96; letter-spacing: 1px; text-transform: uppercase; }
+.sm-zoom { z-index: 4; }
+.sm-zoom button { background: rgba(4,10,20,.75); border-color: rgba(94,224,240,.25); color: #8fe9f7; box-shadow: 0 0 12px rgba(38,125,255,.12); }
+.sm-zoom button:hover { background: rgba(94,224,240,.12); box-shadow: 0 0 18px rgba(94,224,240,.35); }

@@ -1,0 +1,1724 @@
+"""Helpers for acquiring Qzone video upload credentials from OneBot clients."""
+
+from __future__ import annotations
+
+import base64
+import binascii
+import asyncio
+import contextlib
+from dataclasses import dataclass
+import inspect
+import json
+import re
+from typing import Any
+
+from .onebot_cookie import call_onebot_action
+
+
+def _with_onebot_extension_aliases(*actions: str) -> tuple[str, ...]:
+    """Return plain and leading-underscore action names for OneBot extensions."""
+
+    result: list[str] = []
+    for action in actions:
+        text = str(action or "").strip()
+        if not text:
+            continue
+        result.append(text)
+        if not text.startswith("_"):
+            result.append(f"_{text}")
+    return tuple(result)
+
+
+VIDEO_UPLOAD_CREDENTIAL_ACTIONS = _with_onebot_extension_aliases(
+    "get_qzone_video_upload_credentials",
+    "get_qzone_video_upload_login_data",
+    "get_video_upload_credentials",
+    "get_video_upload_login_data",
+    "get_qzone_video_upload_auth",
+    "get_video_upload_auth",
+    "get_qzone_video_upload_a2",
+    "get_qzone_video_upload_a2_ticket",
+    "get_qzone_video_a2",
+    "get_qzone_video_a2_ticket",
+    "get_video_upload_a2",
+    "get_video_upload_a2_ticket",
+    "get_video_a2",
+    "get_video_a2_ticket",
+    "get_qzone_video_vlogin_data",
+    "get_video_vlogin_data",
+    "get_qq_video_upload_credentials",
+    "get_qq_video_upload_login_data",
+    "get_qq_video_upload_auth",
+    "get_qq_video_upload_a2",
+    "get_qq_video_upload_a2_ticket",
+    "get_qq_video_vlogin_data",
+    "get_qzone_upload_credentials",
+    "get_upload_credentials",
+    "get_qzone_upload_auth",
+    "get_upload_auth",
+    "get_qzone_upload_a2",
+    "get_qzone_upload_a2_ticket",
+    "get_upload_a2",
+    "get_upload_a2_ticket",
+    "get_qzone_vlogin_data",
+    "get_vlogin_data",
+    "get_qq_upload_credentials",
+    "get_qq_upload_login_data",
+    "get_qq_upload_auth",
+    "get_qq_upload_a2",
+    "get_qq_upload_a2_ticket",
+    "get_qq_vlogin_data",
+    "get_ntqq_a2",
+    "get_ntqq_a2_ticket",
+    "get_nt_a2_ticket",
+    "get_ntqq_vlogin_data",
+    "get_a2",
+    "get_a2_ticket",
+    "get_upload_login_data",
+    "get_qzone_upload_login_data",
+    "get_ntqq_login_data",
+    "get_login_data",
+    "get_login_info",
+    "get_credentials",
+    "get_cookies",
+    "get_csrf_token",
+)
+LOGIN_MISC_DATA_KEYS = (
+    "a2",
+    "a2_ticket",
+    "a2Ticket",
+    "A2Ticket",
+    "A2",
+    "vLoginData",
+    "v_login_data",
+    "loginData",
+    "login_data",
+    "uploadLoginData",
+    "qzoneUploadLoginData",
+)
+ONEBOT_LOGIN_MISC_ACTIONS = _with_onebot_extension_aliases(
+    "get_login_misc_data",
+    "get_login_misc",
+    "get_ntqq_login_misc_data",
+    "get_ntqq_login_misc",
+    "get_nt_login_misc_data",
+    "get_nt_login_misc",
+    "get_qq_login_misc_data",
+    "get_qq_login_misc",
+    "get_qzone_login_misc_data",
+    "get_qzone_login_misc",
+    "get_qzone_upload_login_misc_data",
+    "get_qzone_video_login_misc_data",
+)
+LOGIN_MISC_PRIMARY_KEYS = ("a2", "vLoginData", "A2", "v_login_data")
+LOGIN_MISC_ACTION_PARAM_VARIANTS: tuple[dict[str, str], ...] = tuple(
+    [
+        *({"key": key} for key in LOGIN_MISC_DATA_KEYS),
+        *(
+            {field: key}
+            for key in LOGIN_MISC_PRIMARY_KEYS
+            for field in ("name", "field")
+        ),
+    ]
+)
+PROTOCOL_ENDPOINT_ACTION_ATTEMPTS: tuple[tuple[str, dict[str, Any]], ...] = (
+    *(
+        (action, params)
+        for action in ONEBOT_LOGIN_MISC_ACTIONS
+        for params in LOGIN_MISC_ACTION_PARAM_VARIANTS
+    ),
+    ("get_a2", {}),
+    ("get_a2_ticket", {}),
+    ("get_ntqq_a2", {}),
+    ("get_ntqq_a2_ticket", {}),
+    ("get_nt_a2_ticket", {}),
+    ("get_qq_upload_a2", {}),
+    ("get_qq_upload_a2_ticket", {}),
+    ("get_qzone_upload_a2", {}),
+    ("get_qzone_upload_a2_ticket", {}),
+    ("get_video_upload_a2", {}),
+    ("get_video_upload_a2_ticket", {}),
+    ("get_vlogin_data", {}),
+    ("get_ntqq_vlogin_data", {}),
+    ("get_qzone_vlogin_data", {}),
+    ("get_video_vlogin_data", {}),
+)
+IMPLEMENTATION_FALLBACK_ACTION_ATTEMPTS: tuple[tuple[str, dict[str, Any]], ...] = (
+    ("llonebot_debug", {"apiClass": "ntUserApi", "method": "getA2", "args": []}),
+    ("llonebot_debug", {"apiClass": "ntUserApi", "method": "getA2Ticket", "args": []}),
+    ("llonebot_debug", {"apiClass": "ntUserApi", "method": "getA2Bytes", "args": []}),
+    ("llonebot_debug", {"apiClass": "ntUserApi", "method": "getQQUploadData", "args": []}),
+    ("llonebot_debug", {"apiClass": "ntUserApi", "method": "getQzoneUploadData", "args": []}),
+    *(
+        (
+            "llonebot_debug",
+            {
+                "apiClass": "pmhq",
+                "method": "invoke",
+                "args": ["nodeIKernelLoginService/getLoginMiscData", [key]],
+            },
+        )
+        for key in LOGIN_MISC_DATA_KEYS
+    ),
+    *(
+        (
+            "llonebot_debug",
+            {
+                "apiClass": "pmhq",
+                "method": "call",
+                "args": ["loginService.getLoginMiscData", [key]],
+            },
+        )
+        for key in LOGIN_MISC_DATA_KEYS
+    ),
+    *(
+        (
+            "llonebot_debug",
+            {
+                "apiClass": "pmhq",
+                "method": "call",
+                "args": ["wrapperSession.getLoginService().getLoginMiscData", [key]],
+            },
+        )
+        for key in LOGIN_MISC_DATA_KEYS
+    ),
+    *(
+        (
+            "llonebot_debug",
+            {
+                "apiClass": "pmhq",
+                "method": "httpSend",
+                "args": [
+                    {
+                        "type": "call",
+                        "data": {"func": "loginService.getLoginMiscData", "args": [key]},
+                    }
+                ],
+            },
+        )
+        for key in LOGIN_MISC_DATA_KEYS
+    ),
+    ("llonebot_debug", {"apiClass": "pmhq", "method": "call", "args": ["getSelfInfo", []]}),
+    ("get_clientkey", {}),
+    ("get_client_key", {}),
+    ("get_ntqq_clientkey", {}),
+    ("get_ntqq_client_key", {}),
+    ("llonebot_debug", {"apiClass": "ntUserApi", "method": "forceFetchClientKey", "args": []}),
+    (
+        "llonebot_debug",
+        {"apiClass": "pmhq", "method": "invoke", "args": ["nodeIKernelTicketService/forceFetchClientKey", [""]]},
+    ),
+    (
+        "llonebot_debug",
+        {"apiClass": "pmhq", "method": "invoke", "args": ["nodeIKernelTicketService/getA2Ticket", []]},
+    ),
+    (
+        "llonebot_debug",
+        {"apiClass": "pmhq", "method": "call", "args": ["wrapperSession.getTicketService().getA2Ticket", []]},
+    ),
+    (
+        "llonebot_debug",
+        {"apiClass": "pmhq", "method": "call", "args": ["wrapperSession.getTicketService().GetA2Ticket", []]},
+    ),
+)
+LOGIN_DATA_KEYS = {
+    "login_data",
+    "logindata",
+    "login_data_b64",
+    "login_data_base64",
+    "login_data_hex",
+    "login_data_bytes",
+    "vlogindata",
+    "v_login_data",
+    "v_login_data_b64",
+    "v_login_data_base64",
+    "v_login_data_hex",
+    "v_login_data_bytes",
+    "vLoginData",
+    "vLoginDataB64",
+    "vLoginDataBase64",
+    "vLoginDataHex",
+    "vLoginDataBytes",
+    "upload_login_data",
+    "uploadLoginData",
+    "upload_login_data_b64",
+    "upload_login_data_base64",
+    "upload_login_data_hex",
+    "upload_login_data_bytes",
+    "uploadLoginDataB64",
+    "uploadLoginDataBase64",
+    "uploadLoginDataHex",
+    "uploadLoginDataBytes",
+    "qzone_upload_login_data",
+    "qzoneUploadLoginData",
+    "qzoneUploadLoginDataB64",
+    "qzoneUploadLoginDataBase64",
+    "qzoneUploadLoginDataHex",
+    "qzoneUploadLoginDataBytes",
+    "a2",
+    "a2_ticket",
+    "a2_ticket_b64",
+    "a2_ticket_base64",
+    "a2_ticket_hex",
+    "a2_ticket_bytes",
+    "a2Ticket",
+    "a2TicketB64",
+    "a2TicketBase64",
+    "a2TicketHex",
+    "a2TicketBytes",
+    "a2_b64",
+    "a2_base64",
+    "a2_hex",
+    "a2_bytes",
+    "A2",
+    "A2Ticket",
+    "A2TicketB64",
+    "A2TicketBase64",
+    "A2TicketHex",
+    "A2TicketBytes",
+    "A2B64",
+    "A2Base64",
+    "A2Hex",
+    "A2Bytes",
+}
+LOGIN_KEY_KEYS = {
+    "login_key",
+    "loginkey",
+    "login_key_b64",
+    "login_key_base64",
+    "login_key_hex",
+    "login_key_bytes",
+    "vloginkey",
+    "v_login_key",
+    "v_login_key_b64",
+    "v_login_key_base64",
+    "v_login_key_hex",
+    "v_login_key_bytes",
+    "vLoginKey",
+    "vLoginKeyB64",
+    "vLoginKeyBase64",
+    "vLoginKeyHex",
+    "vLoginKeyBytes",
+    "upload_login_key",
+    "uploadLoginKey",
+    "upload_login_key_b64",
+    "upload_login_key_base64",
+    "upload_login_key_hex",
+    "upload_login_key_bytes",
+    "uploadLoginKeyB64",
+    "uploadLoginKeyBase64",
+    "uploadLoginKeyHex",
+    "uploadLoginKeyBytes",
+    "qzone_upload_login_key",
+    "qzoneUploadLoginKey",
+    "qzoneUploadLoginKeyB64",
+    "qzoneUploadLoginKeyBase64",
+    "qzoneUploadLoginKeyHex",
+    "qzoneUploadLoginKeyBytes",
+    "a2_key",
+    "a2Key",
+    "a2_key_b64",
+    "a2_key_base64",
+    "a2_key_hex",
+    "a2_key_bytes",
+}
+TOKEN_TYPE_KEYS = {"token_type", "tokenType", "type"}
+TOKEN_APPID_KEYS = {"token_appid", "tokenAppid", "appid", "app_id"}
+TOKEN_WT_APPID_KEYS = {"token_wt_appid", "tokenWtAppid", "wt_appid", "wtAppid"}
+WRAPPER_KEYS = ("data", "result", "retdata", "ret_data", "payload", "response", "credentials", "video_upload")
+HEX_RE = re.compile(r"^(?:0x)?[0-9a-fA-F]{16,}$")
+VIDEO_UPLOAD_ACTION_TIMEOUT_SECONDS = 4.0
+WEB_CREDENTIAL_KEYS = {
+    "cookie",
+    "cookies",
+    "bkn",
+    "g_tk",
+    "gtk",
+    "csrf_token",
+    "csrfToken",
+    "skey",
+    "p_skey",
+    "pskey",
+    "qzonetoken",
+}
+CLIENT_KEY_KEYS = {
+    "clientkey",
+    "client_key",
+    "clientKey",
+    "keyindex",
+    "keyIndex",
+}
+FILE_TRANS_SIG_KEYS = {
+    "forceFetchFileTransSig",
+    "ForceFetchFileTransSig",
+    "fileTransSig",
+    "file_trans_sig",
+}
+REJECTED_RAW_LOGIN_DATA_ACTION_HINTS = {
+    "getclientkey",
+    "getcookie",
+    "getcookies",
+    "getcsrftoken",
+    "getpskey",
+}
+REJECTED_RAW_LOGIN_DATA_METHOD_HINTS = {
+    "forcefetchclientkey",
+    "forcefetchfiletranssig",
+    "nodeikernelticketserviceforcefetchclientkey",
+    "nodeikernelticketserviceforcefetchfiletranssig",
+}
+RAW_LOGIN_DATA_METHOD_HINTS = {
+    "geta2",
+    "geta2ticket",
+    "geta2bytes",
+    "getqquploaddata",
+    "getqzoneuploaddata",
+    "getloginmiscdata",
+    "nodeikernelloginservicegetloginmiscdata",
+    "nodeikernelticketservicegeta2ticket",
+    "loginservicegetloginmiscdata",
+    "wrappersessiongetloginservicegetloginmiscdata",
+    "wrappersessiongetticketservicegeta2ticket",
+}
+RAW_LOGIN_DATA_ACTION_HINTS = {
+    "getqzonevideouploadcredentials",
+    "getqzonevideouploadlogindata",
+    "getvideouploadcredentials",
+    "getvideouploadlogindata",
+    "getqzonevideouploadauth",
+    "getvideouploadauth",
+    "getqzonevideouploada2",
+    "getqzonevideouploada2ticket",
+    "getqzonevideoa2",
+    "getqzonevideoa2ticket",
+    "getvideouploada2",
+    "getvideouploada2ticket",
+    "getvideoa2",
+    "getvideoa2ticket",
+    "getqzonevideovlogindata",
+    "getvideovlogindata",
+    "getqqvideouploadcredentials",
+    "getqqvideouploadlogindata",
+    "getqqvideouploadauth",
+    "getqqvideouploada2",
+    "getqqvideouploada2ticket",
+    "getqqvideovlogindata",
+    "getqzoneuploadcredentials",
+    "getuploadcredentials",
+    "getqzoneuploadauth",
+    "getuploadauth",
+    "getqzoneuploada2",
+    "getqzoneuploada2ticket",
+    "getuploada2",
+    "getuploada2ticket",
+    "getqzonevlogindata",
+    "getvlogindata",
+    "getqquploadcredentials",
+    "getqquploadlogindata",
+    "getqquploadauth",
+    "getqquploada2",
+    "getqquploada2ticket",
+    "getqqvlogindata",
+    "getntqqa2",
+    "getntqqa2ticket",
+    "getnta2ticket",
+    "getntqqvlogindata",
+    "geta2",
+    "geta2ticket",
+    "getuploadlogindata",
+    "getqzoneuploadlogindata",
+    "getntqqlogindata",
+    "getlogindata",
+    "getloginmiscdata",
+    "getloginmisc",
+    "getntqqloginmiscdata",
+    "getntqqloginmisc",
+    "getntloginmiscdata",
+    "getntloginmisc",
+    "getqqloginmiscdata",
+    "getqqloginmisc",
+    "getqzoneloginmiscdata",
+    "getqzoneloginmisc",
+    "getqzoneuploadloginmiscdata",
+    "getqzonevideologinmiscdata",
+}
+RAW_LOGIN_DATA_WRAPPER_KEYS = WRAPPER_KEYS + ("value", "ticket", "buffer")
+MIN_RAW_LOGIN_DATA_BYTES = 8
+
+
+@dataclass(frozen=True, slots=True)
+class OneBotVideoUploadCredentials:
+    login_data_b64: str
+    login_key_b64: str = ""
+    token_type: int = 2
+    token_appid: int = 0
+    token_wt_appid: int = 0
+    source: str = "onebot"
+
+    def to_request_body(self) -> dict[str, Any]:
+        return {
+            "login_data_b64": self.login_data_b64,
+            "login_key_b64": self.login_key_b64,
+            "token_type": self.token_type,
+            "token_appid": self.token_appid,
+            "token_wt_appid": self.token_wt_appid,
+            "source": self.source,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class OneBotVideoUploadProbe:
+    credentials: OneBotVideoUploadCredentials | None = None
+    attempted_actions: tuple[str, ...] = ()
+    returned_actions: tuple[str, ...] = ()
+    web_credential_actions: tuple[str, ...] = ()
+    client_key_actions: tuple[str, ...] = ()
+    empty_login_data_actions: tuple[str, ...] = ()
+    error_count: int = 0
+
+    def public_detail(self) -> dict[str, Any]:
+        return {
+            "credentials_found": self.credentials is not None,
+            "attempted_actions": list(self.attempted_actions),
+            "returned_actions": list(self.returned_actions),
+            "web_credential_actions": list(self.web_credential_actions),
+            "client_key_actions": list(self.client_key_actions),
+            "empty_login_data_actions": list(self.empty_login_data_actions),
+            "error_count": self.error_count,
+        }
+
+
+async def fetch_video_upload_credentials(bot: Any, *, source: str = "onebot") -> OneBotVideoUploadCredentials | None:
+    """Try protocol-end extension actions and return upload credentials if exposed."""
+
+    probe = await probe_video_upload_credentials(bot, source=source)
+    return probe.credentials
+
+
+async def probe_video_upload_credentials(bot: Any, *, source: str = "onebot") -> OneBotVideoUploadProbe:
+    """Probe OneBot standard and extension actions for QQ upload binary material.
+
+    Standard OneBot implementation ``get_credentials`` usually returns web
+    cookies plus csrf/bkn. Those are useful for Qzone web binding, but are not
+    enough for the stable mobile ``video_qzone`` upload protocol. This probe
+    records cookie-only responses separately and only returns credentials when
+    a real vLoginData/A2-like binary field is present.
+    """
+
+    attempted: list[str] = []
+    returned: list[str] = []
+    web_only: list[str] = []
+    client_key_only: list[str] = []
+    empty_login_data: list[str] = []
+    error_count = 0
+    for action in _unique(VIDEO_UPLOAD_CREDENTIAL_ACTIONS):
+        for params in _video_upload_action_param_variants(action):
+            attempted.append(_action_label(action, params))
+            try:
+                payload = await asyncio.wait_for(
+                    call_onebot_action(bot, action, **params),
+                    timeout=VIDEO_UPLOAD_ACTION_TIMEOUT_SECONDS,
+                )
+            except Exception:
+                error_count += 1
+                continue
+            returned.append(action)
+            source_name = f"{source}:{action}"
+            credentials = _extract_probe_credentials(action, params, payload, source=source_name)
+            if credentials is not None:
+                return OneBotVideoUploadProbe(
+                    credentials=credentials,
+                    attempted_actions=tuple(_unique(attempted)),
+                    returned_actions=tuple(_unique(returned)),
+                    web_credential_actions=tuple(_unique(web_only)),
+                    client_key_actions=tuple(_unique(client_key_only)),
+                    empty_login_data_actions=tuple(_unique(empty_login_data)),
+                    error_count=error_count,
+                )
+            _record_empty_login_data_response(empty_login_data, action, params, payload)
+            if _payload_has_web_credentials(payload):
+                web_only.append(action)
+            if _action_targets_client_key(action, params) or _payload_has_client_key(payload):
+                client_key_only.append(action)
+    for action, params in PROTOCOL_ENDPOINT_ACTION_ATTEMPTS:
+        attempted.append(_action_label(action, params))
+        try:
+            payload = await asyncio.wait_for(
+                call_onebot_action(bot, action, **params),
+                timeout=VIDEO_UPLOAD_ACTION_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            error_count += 1
+            continue
+        returned.append(action)
+        source_name = f"{source}:{action}"
+        credentials = _extract_probe_credentials(action, params, payload, source=source_name)
+        if credentials is not None:
+            return OneBotVideoUploadProbe(
+                credentials=credentials,
+                attempted_actions=tuple(_unique(attempted)),
+                returned_actions=tuple(_unique(returned)),
+                web_credential_actions=tuple(_unique(web_only)),
+                client_key_actions=tuple(_unique(client_key_only)),
+                empty_login_data_actions=tuple(_unique(empty_login_data)),
+                error_count=error_count,
+            )
+        _record_empty_login_data_response(empty_login_data, action, params, payload)
+        if _payload_has_web_credentials(payload):
+            web_only.append(action)
+        if _action_targets_client_key(action, params) or _payload_has_client_key(payload):
+            client_key_only.append(action)
+    embedded_credentials, error_count = await _probe_embedded_ntqq_login_misc(
+        bot,
+        source=source,
+        attempted=attempted,
+        returned=returned,
+        web_only=web_only,
+        client_key_only=client_key_only,
+        empty_login_data=empty_login_data,
+        error_count=error_count,
+    )
+    if embedded_credentials is not None:
+        return OneBotVideoUploadProbe(
+            credentials=embedded_credentials,
+            attempted_actions=tuple(_unique(attempted)),
+            returned_actions=tuple(_unique(returned)),
+            web_credential_actions=tuple(_unique(web_only)),
+            client_key_actions=tuple(_unique(client_key_only)),
+            empty_login_data_actions=tuple(_unique(empty_login_data)),
+            error_count=error_count,
+        )
+    for action, params in IMPLEMENTATION_FALLBACK_ACTION_ATTEMPTS:
+        attempted.append(_action_label(action, params))
+        try:
+            payload = await asyncio.wait_for(
+                call_onebot_action(bot, action, **params),
+                timeout=VIDEO_UPLOAD_ACTION_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            error_count += 1
+            continue
+        returned.append(action)
+        source_name = f"{source}:{action}"
+        credentials = _extract_probe_credentials(action, params, payload, source=source_name)
+        if credentials is not None:
+            return OneBotVideoUploadProbe(
+                credentials=credentials,
+                attempted_actions=tuple(_unique(attempted)),
+                returned_actions=tuple(_unique(returned)),
+                web_credential_actions=tuple(_unique(web_only)),
+                client_key_actions=tuple(_unique(client_key_only)),
+                empty_login_data_actions=tuple(_unique(empty_login_data)),
+                error_count=error_count,
+            )
+        _record_empty_login_data_response(empty_login_data, action, params, payload)
+        if _payload_has_web_credentials(payload):
+            web_only.append(action)
+        if _action_targets_client_key(action, params) or _payload_has_client_key(payload):
+            client_key_only.append(action)
+    return OneBotVideoUploadProbe(
+        credentials=None,
+        attempted_actions=tuple(_unique(attempted)),
+        returned_actions=tuple(_unique(returned)),
+        web_credential_actions=tuple(_unique(web_only)),
+        client_key_actions=tuple(_unique(client_key_only)),
+        empty_login_data_actions=tuple(_unique(empty_login_data)),
+        error_count=error_count,
+    )
+
+
+def _extract_probe_credentials(
+    action: str,
+    params: dict[str, Any] | None,
+    payload: Any,
+    *,
+    source: str,
+) -> OneBotVideoUploadCredentials | None:
+    if _action_targets_rejected_login_data(action, params):
+        return None
+    credentials = extract_video_upload_credentials(payload, source=source)
+    if credentials is None and _action_may_return_raw_login_data(action, params):
+        credentials = _extract_raw_login_data_payload(
+            payload,
+            source=source,
+            trusted_raw=_action_targets_login_data(action, params),
+        )
+    return credentials
+
+
+def _video_upload_action_param_variants(action: str) -> tuple[dict[str, Any], ...]:
+    normalized = _normalize_key(action)
+    domain_variants: tuple[dict[str, Any], ...] = (
+        {"domain": "qzone.qq.com"},
+        {"domain": "user.qzone.qq.com"},
+        {"domain": "h5.qzone.qq.com"},
+        {},
+    )
+    business_variants: tuple[dict[str, Any], ...] = (
+        {"appid": "video_qzone"},
+        {"business": "video_qzone"},
+    )
+    if normalized in {"getcookies", "getcredentials", "getcsrftoken"}:
+        return domain_variants
+    if (
+        "credentials" in normalized
+        or "auth" in normalized
+        or "credential" in normalized
+    ):
+        return (*domain_variants, *business_variants)
+    if (
+        "a2" in normalized
+        or "vlogindata" in normalized
+        or "logindata" in normalized
+    ):
+        return ({}, {"domain": "qzone.qq.com"}, *business_variants)
+    return (*domain_variants, *business_variants)
+
+
+async def _probe_embedded_ntqq_login_misc(
+    bot: Any,
+    *,
+    source: str,
+    attempted: list[str],
+    returned: list[str],
+    web_only: list[str],
+    client_key_only: list[str],
+    empty_login_data: list[str],
+    error_count: int,
+) -> tuple[OneBotVideoUploadCredentials | None, int]:
+    """Try native NTQQ service handles when an AstrBot adapter exposes them.
+
+    The preferred contract is still a OneBot action such as
+    ``get_login_misc_data(key=a2)``.  This fallback exists because current
+    NapCat exposes ``NodeIKernelLoginService.getLoginMiscData`` internally
+    while not exposing a matching OneBot action in its default HTTP/WS API.
+    If an adapter passes that internal object through, use it without logging
+    or returning the secret material.
+    """
+
+    for key in LOGIN_MISC_DATA_KEYS:
+        for label, call in _embedded_ntqq_login_misc_callables(bot, key):
+            attempted.append(label)
+            try:
+                payload = await asyncio.wait_for(_maybe_await(call()), timeout=VIDEO_UPLOAD_ACTION_TIMEOUT_SECONDS)
+            except Exception:
+                error_count += 1
+                continue
+            returned.append(label)
+            source_name = f"{source}:{label}"
+            credentials = extract_video_upload_credentials(payload, source=source_name)
+            if credentials is None:
+                credentials = _extract_raw_login_data_payload(payload, source=source_name, trusted_raw=True)
+            if credentials is not None:
+                return credentials, error_count
+            if _payload_has_empty_login_data(payload):
+                empty_login_data.append(label)
+            if _payload_has_web_credentials(payload):
+                web_only.append(label)
+            if _payload_has_client_key(payload):
+                client_key_only.append(label)
+    return None, error_count
+
+
+async def _maybe_await(value: Any) -> Any:
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+def _embedded_ntqq_login_misc_callables(bot: Any, key: str) -> list[tuple[str, Any]]:
+    calls: list[tuple[str, Any]] = []
+    seen: set[str] = set()
+    normalized_key = _normalize_key(key)
+
+    def add(label: str, fn: Any) -> None:
+        if label in seen or not callable(fn):
+            return
+        seen.add(label)
+        calls.append((label, fn))
+
+    for owner_label, owner in _embedded_owner_candidates(bot):
+        for method_name in ("get_login_misc_data", "getLoginMiscData"):
+            method = _safe_getattr(owner, method_name)
+            if callable(method):
+                add(f"embedded:{owner_label}.{method_name}:key={key}", lambda method=method, key=key: method(key))
+        if normalized_key == "a2":
+            for method_name in ("get_a2", "getA2", "getA2Ticket", "GetA2Ticket", "getA2Bytes", "getQQUploadData", "getQzoneUploadData"):
+                method = _safe_getattr(owner, method_name)
+                if callable(method):
+                    add(f"embedded:{owner_label}.{method_name}", lambda method=method: method())
+
+        for event_wrapper_label, event_wrapper in _event_wrapper_candidates(owner_label, owner):
+            caller = _safe_getattr(event_wrapper, "callNoListenerEvent")
+            if callable(caller):
+                add(
+                    f"embedded:{event_wrapper_label}.callNoListenerEvent:NodeIKernelLoginService/getLoginMiscData,key={key}",
+                    lambda caller=caller, key=key: caller("NodeIKernelLoginService/getLoginMiscData", key),
+                )
+
+        for service_label, service in _login_service_candidates(owner_label, owner):
+            method = _safe_getattr(service, "getLoginMiscData")
+            if callable(method):
+                add(f"embedded:{service_label}.getLoginMiscData:key={key}", lambda method=method, key=key: method(key))
+
+        if normalized_key == "a2":
+            for service_label, service in _ticket_service_candidates(owner_label, owner):
+                for method_name in ("getA2Ticket", "GetA2Ticket", "get_a2_ticket"):
+                    method = _safe_getattr(service, method_name)
+                    if callable(method):
+                        add(f"embedded:{service_label}.{method_name}", lambda method=method: method())
+
+        for pmhq_label, pmhq in _pmhq_candidates(owner_label, owner):
+            invoke = _safe_getattr(pmhq, "invoke")
+            if callable(invoke):
+                add(
+                    f"embedded:{pmhq_label}.invoke:NodeIKernelLoginService/getLoginMiscData,key={key}",
+                    lambda invoke=invoke, key=key: invoke("nodeIKernelLoginService/getLoginMiscData", [key]),
+                )
+                if normalized_key == "a2":
+                    add(
+                        f"embedded:{pmhq_label}.invoke:NodeIKernelTicketService/getA2Ticket",
+                        lambda invoke=invoke: invoke("nodeIKernelTicketService/getA2Ticket", []),
+                    )
+            call = _safe_getattr(pmhq, "call")
+            if callable(call):
+                add(
+                    f"embedded:{pmhq_label}.call:loginService.getLoginMiscData,key={key}",
+                    lambda call=call, key=key: call("loginService.getLoginMiscData", [key]),
+                )
+                add(
+                    f"embedded:{pmhq_label}.call:wrapperSession.getLoginService().getLoginMiscData,key={key}",
+                    lambda call=call, key=key: call("wrapperSession.getLoginService().getLoginMiscData", [key]),
+                )
+                if normalized_key == "a2":
+                    add(
+                        f"embedded:{pmhq_label}.call:wrapperSession.getTicketService().getA2Ticket",
+                        lambda call=call: call("wrapperSession.getTicketService().getA2Ticket", []),
+                    )
+                    add(
+                        f"embedded:{pmhq_label}.call:wrapperSession.getTicketService().GetA2Ticket",
+                        lambda call=call: call("wrapperSession.getTicketService().GetA2Ticket", []),
+                    )
+    return calls
+
+
+def _embedded_owner_candidates(bot: Any) -> list[tuple[str, Any]]:
+    candidates: list[tuple[str, Any]] = []
+    seen_ids: set[int] = set()
+
+    def add(label: str, value: Any) -> None:
+        if value is None:
+            return
+        obj_id = id(value)
+        if obj_id in seen_ids:
+            return
+        seen_ids.add(obj_id)
+        candidates.append((label, value))
+
+    add("bot", bot)
+    for attr in (
+        "api",
+        "client",
+        "bot",
+        "onebot",
+        "cqhttp",
+        "api_client",
+        "adapter",
+        "core",
+        "context",
+        "ctx",
+        "session",
+        "wrapper",
+        "runtime",
+        "nt",
+        "ntqq",
+        "napcat",
+    ):
+        value = _safe_getattr(bot, attr)
+        add(f"bot.{attr}", value)
+    return candidates
+
+
+def _event_wrapper_candidates(owner_label: str, owner: Any) -> list[tuple[str, Any]]:
+    candidates: list[tuple[str, Any]] = []
+    for prefix, value in (
+        (owner_label, _safe_getattr(owner, "eventWrapper")),
+        (f"{owner_label}.core", _safe_getattr(_safe_getattr(owner, "core"), "eventWrapper")),
+    ):
+        if value is not None:
+            candidates.append((f"{prefix}.eventWrapper", value))
+    return candidates
+
+
+def _login_service_candidates(owner_label: str, owner: Any) -> list[tuple[str, Any]]:
+    candidates: list[tuple[str, Any]] = []
+    for session_label, session in (
+        (f"{owner_label}.session", _safe_getattr(owner, "session")),
+        (f"{owner_label}.wrapperSession", _safe_getattr(owner, "wrapperSession")),
+        (f"{owner_label}.context.session", _safe_getattr(_safe_getattr(owner, "context"), "session")),
+        (f"{owner_label}.ctx.session", _safe_getattr(_safe_getattr(owner, "ctx"), "session")),
+    ):
+        if session is None:
+            continue
+        getter = _safe_getattr(session, "getLoginService")
+        if callable(getter):
+            try:
+                service = getter()
+            except Exception:
+                service = None
+            if service is not None:
+                candidates.append((f"{session_label}.getLoginService()", service))
+        service = _safe_getattr(session, "NodeIKernelLoginService")
+        if service is not None:
+            candidates.append((f"{session_label}.NodeIKernelLoginService", service))
+    wrapper_login_service = _safe_getattr(_safe_getattr(owner, "wrapper"), "NodeIKernelLoginService")
+    if wrapper_login_service is not None:
+        getter = _safe_getattr(wrapper_login_service, "get")
+        if callable(getter):
+            try:
+                wrapper_login_service = getter()
+            except Exception:
+                pass
+        candidates.append((f"{owner_label}.wrapper.NodeIKernelLoginService", wrapper_login_service))
+    return candidates
+
+
+def _ticket_service_candidates(owner_label: str, owner: Any) -> list[tuple[str, Any]]:
+    candidates: list[tuple[str, Any]] = []
+    for session_label, session in (
+        (f"{owner_label}.session", _safe_getattr(owner, "session")),
+        (f"{owner_label}.wrapperSession", _safe_getattr(owner, "wrapperSession")),
+        (f"{owner_label}.context.session", _safe_getattr(_safe_getattr(owner, "context"), "session")),
+        (f"{owner_label}.ctx.session", _safe_getattr(_safe_getattr(owner, "ctx"), "session")),
+    ):
+        if session is None:
+            continue
+        getter = _safe_getattr(session, "getTicketService")
+        if callable(getter):
+            try:
+                service = getter()
+            except Exception:
+                service = None
+            if service is not None:
+                candidates.append((f"{session_label}.getTicketService()", service))
+        service = _safe_getattr(session, "NodeIKernelTicketService")
+        if service is not None:
+            candidates.append((f"{session_label}.NodeIKernelTicketService", service))
+    wrapper_ticket_service = _safe_getattr(_safe_getattr(owner, "wrapper"), "NodeIKernelTicketService")
+    if wrapper_ticket_service is not None:
+        getter = _safe_getattr(wrapper_ticket_service, "get")
+        if callable(getter):
+            try:
+                wrapper_ticket_service = getter()
+            except Exception:
+                pass
+        candidates.append((f"{owner_label}.wrapper.NodeIKernelTicketService", wrapper_ticket_service))
+    return candidates
+
+
+def _pmhq_candidates(owner_label: str, owner: Any) -> list[tuple[str, Any]]:
+    candidates: list[tuple[str, Any]] = []
+    pmhq = _safe_getattr(owner, "pmhq")
+    if pmhq is not None:
+        candidates.append((f"{owner_label}.pmhq", pmhq))
+    getter = _safe_getattr(owner, "get")
+    if callable(getter):
+        try:
+            pmhq = getter("pmhq")
+        except Exception:
+            pmhq = None
+        if inspect.isawaitable(pmhq):
+            with contextlib.suppress(Exception):
+                pmhq.close()
+            pmhq = None
+        if pmhq is not None:
+            candidates.append((f"{owner_label}.get(pmhq)", pmhq))
+    return candidates
+
+
+def _safe_getattr(owner: Any, attr: str) -> Any:
+    try:
+        return getattr(owner, attr, None)
+    except Exception:
+        return None
+
+
+def _action_label(action: str, params: dict[str, Any]) -> str:
+    if not params:
+        return action
+    parts = [f"{key}={_safe_label_value(value)}" for key, value in sorted(params.items())]
+    return f"{action}:{','.join(parts)}"
+
+
+def _safe_label_value(value: Any) -> str:
+    if isinstance(value, dict):
+        return "{" + ",".join(f"{key}:{_safe_label_value(val)}" for key, val in sorted(value.items())) + "}"
+    if isinstance(value, (list, tuple)):
+        return "[" + ",".join(_safe_label_value(item) for item in value) + "]"
+    text = str(value or "")
+    if len(text) > 80:
+        return text[:77] + "..."
+    return text
+
+
+def _unique(values: tuple[str, ...] | list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        text = str(value or "")
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return result
+
+
+def extract_video_upload_credentials(payload: Any, *, source: str = "onebot") -> OneBotVideoUploadCredentials | None:
+    found = _find_credentials(payload)
+    if not found:
+        return None
+    login_data = found.get("login_data_b64") or ""
+    if not login_data:
+        return None
+    return OneBotVideoUploadCredentials(
+        login_data_b64=login_data,
+        login_key_b64=found.get("login_key_b64") or "",
+        token_type=_as_int(found.get("token_type"), 2),
+        token_appid=_as_int(found.get("token_appid"), 0),
+        token_wt_appid=_as_int(found.get("token_wt_appid"), 0),
+        source=source,
+    )
+
+
+def _find_credentials(payload: Any, *, _depth: int = 0, _seen: set[int] | None = None) -> dict[str, Any] | None:
+    if _seen is None:
+        _seen = set()
+    if payload is None or _depth > 8:
+        return None
+    if isinstance(payload, bytes):
+        encoded = _bytes_value_to_b64(payload)
+        return {"login_data_b64": encoded} if encoded else None
+    if isinstance(payload, str):
+        text = payload.strip()
+        if not text:
+            return None
+        if text.startswith("{") or text.startswith("["):
+            try:
+                return _find_credentials(json.loads(text), _depth=_depth + 1, _seen=_seen)
+            except Exception:
+                return None
+        return None
+    if isinstance(payload, (list, tuple)):
+        for item in payload:
+            found = _find_credentials(item, _depth=_depth + 1, _seen=_seen)
+            if found:
+                return found
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    obj_id = id(payload)
+    if obj_id in _seen:
+        return None
+    _seen.add(obj_id)
+    if _dict_reports_failure_status(payload):
+        return None
+
+    normalized_login_data_keys = {_normalize_key(item) for item in LOGIN_DATA_KEYS}
+    normalized_login_key_keys = {_normalize_key(item) for item in LOGIN_KEY_KEYS}
+    normalized_token_type_keys = {_normalize_key(item) for item in TOKEN_TYPE_KEYS}
+    normalized_token_appid_keys = {_normalize_key(item) for item in TOKEN_APPID_KEYS}
+    normalized_token_wt_appid_keys = {_normalize_key(item) for item in TOKEN_WT_APPID_KEYS}
+    normalized_client_keys = {_normalize_key(key) for key in CLIENT_KEY_KEYS}
+    normalized_web_keys = {_normalize_key(key) for key in WEB_CREDENTIAL_KEYS}
+    normalized_file_trans_sig_keys = {_normalize_key(key) for key in FILE_TRANS_SIG_KEYS}
+
+    result: dict[str, Any] = {}
+    for key, value in payload.items():
+        normalized = _normalize_key(key)
+        if normalized in normalized_login_data_keys:
+            encoded = _value_to_b64(value)
+            if encoded:
+                result["login_data_b64"] = encoded
+        elif normalized in normalized_login_key_keys:
+            encoded = _value_to_b64(value)
+            if encoded:
+                result["login_key_b64"] = encoded
+        elif normalized in normalized_token_type_keys:
+            result["token_type"] = value
+        elif normalized in normalized_token_appid_keys:
+            result["token_appid"] = value
+        elif normalized in normalized_token_wt_appid_keys:
+            result["token_wt_appid"] = value
+    if result.get("login_data_b64"):
+        return result
+
+    for key in WRAPPER_KEYS:
+        if key in payload:
+            found = _find_credentials(payload.get(key), _depth=_depth + 1, _seen=_seen)
+            if found:
+                return found
+    for key, value in payload.items():
+        normalized = _normalize_key(key)
+        if (
+            normalized in normalized_client_keys
+            or normalized in normalized_web_keys
+            or normalized in normalized_file_trans_sig_keys
+        ):
+            continue
+        if isinstance(value, (dict, list, tuple, str, bytes)):
+            found = _find_credentials(value, _depth=_depth + 1, _seen=_seen)
+            if found:
+                return found
+    return None
+
+
+def _payload_has_web_credentials(payload: Any, *, _depth: int = 0, _seen: set[int] | None = None) -> bool:
+    if _seen is None:
+        _seen = set()
+    if payload is None or _depth > 6:
+        return False
+    if isinstance(payload, str):
+        text = payload.strip()
+        if not text:
+            return False
+        if "uin=" in text and ("skey=" in text or "p_skey=" in text):
+            return True
+        if text.startswith("{") or text.startswith("["):
+            try:
+                return _payload_has_web_credentials(json.loads(text), _depth=_depth + 1, _seen=_seen)
+            except Exception:
+                return False
+        return False
+    if isinstance(payload, (list, tuple)):
+        return any(_payload_has_web_credentials(item, _depth=_depth + 1, _seen=_seen) for item in payload)
+    if not isinstance(payload, dict):
+        return False
+    obj_id = id(payload)
+    if obj_id in _seen:
+        return False
+    _seen.add(obj_id)
+    normalized_keys = {_normalize_key(key) for key in WEB_CREDENTIAL_KEYS}
+    for key, value in payload.items():
+        if _normalize_key(key) in normalized_keys and value not in (None, "", [], {}):
+            return True
+    return any(
+        _payload_has_web_credentials(value, _depth=_depth + 1, _seen=_seen)
+        for value in payload.values()
+        if isinstance(value, (dict, list, tuple, str))
+    )
+
+
+def _payload_has_client_key(payload: Any, *, _depth: int = 0, _seen: set[int] | None = None) -> bool:
+    if _seen is None:
+        _seen = set()
+    if payload is None or _depth > 6:
+        return False
+    if isinstance(payload, bytes):
+        return False
+    if isinstance(payload, str):
+        text = payload.strip()
+        if not text:
+            return False
+        lowered = text.lower()
+        if "clientkey=" in lowered or "client_key=" in lowered or '"clientkey"' in lowered or '"client_key"' in lowered:
+            return True
+        if text.startswith("{") or text.startswith("["):
+            try:
+                return _payload_has_client_key(json.loads(text), _depth=_depth + 1, _seen=_seen)
+            except Exception:
+                return False
+        return False
+    if isinstance(payload, (list, tuple)):
+        return any(_payload_has_client_key(item, _depth=_depth + 1, _seen=_seen) for item in payload)
+    if not isinstance(payload, dict):
+        return False
+    obj_id = id(payload)
+    if obj_id in _seen:
+        return False
+    _seen.add(obj_id)
+    normalized_keys = {_normalize_key(key) for key in CLIENT_KEY_KEYS}
+    for key, value in payload.items():
+        if _normalize_key(key) in normalized_keys and value not in (None, "", [], {}):
+            return True
+    return any(
+        _payload_has_client_key(value, _depth=_depth + 1, _seen=_seen)
+        for value in payload.values()
+        if isinstance(value, (dict, list, tuple, str))
+    )
+
+
+def _payload_has_file_trans_sig(payload: Any, *, _depth: int = 0, _seen: set[int] | None = None) -> bool:
+    if _seen is None:
+        _seen = set()
+    if payload is None or _depth > 6:
+        return False
+    if isinstance(payload, bytes):
+        return False
+    if isinstance(payload, str):
+        text = payload.strip()
+        if not text:
+            return False
+        lowered = _normalize_key(text)
+        if "forcefetchfiletranssig" in lowered or "filetranssig" in lowered:
+            return True
+        if text.startswith("{") or text.startswith("["):
+            try:
+                return _payload_has_file_trans_sig(json.loads(text), _depth=_depth + 1, _seen=_seen)
+            except Exception:
+                return False
+        return False
+    if isinstance(payload, (list, tuple)):
+        return any(_payload_has_file_trans_sig(item, _depth=_depth + 1, _seen=_seen) for item in payload)
+    if not isinstance(payload, dict):
+        return False
+    obj_id = id(payload)
+    if obj_id in _seen:
+        return False
+    _seen.add(obj_id)
+    normalized_keys = {_normalize_key(key) for key in FILE_TRANS_SIG_KEYS}
+    for key, value in payload.items():
+        if _normalize_key(key) in normalized_keys and value not in (None, "", [], {}):
+            return True
+    return any(
+        _payload_has_file_trans_sig(value, _depth=_depth + 1, _seen=_seen)
+        for value in payload.values()
+        if isinstance(value, (dict, list, tuple, str))
+    )
+
+
+def _record_empty_login_data_response(
+    empty_login_data: list[str],
+    action: str,
+    params: dict[str, Any] | None,
+    payload: Any,
+) -> None:
+    if _action_targets_login_data(action, params) and _payload_has_empty_login_data(payload):
+        empty_login_data.append(_action_label(action, params or {}))
+
+
+def _payload_has_empty_login_data(payload: Any, *, _depth: int = 0, _seen: set[int] | None = None) -> bool:
+    if _seen is None:
+        _seen = set()
+    if payload is None or _depth > 6:
+        return payload in (None, "", [], {})
+    if isinstance(payload, str):
+        text = payload.strip()
+        if not text:
+            return True
+        lowered = text.lower()
+        return any(
+            marker in lowered
+            for marker in (
+                "not available",
+                "not a function",
+                "no method",
+                "unsupported",
+                "error",
+                "failed",
+                "timeout",
+                "没有方法",
+                "不支持",
+                "失败",
+            )
+        )
+    if isinstance(payload, (bytes, bytearray)):
+        return len(payload) == 0
+    if isinstance(payload, (list, tuple)):
+        return len(payload) == 0 or all(
+            _payload_has_empty_login_data(item, _depth=_depth + 1, _seen=_seen)
+            for item in payload
+        )
+    if not isinstance(payload, dict):
+        return False
+    obj_id = id(payload)
+    if obj_id in _seen:
+        return False
+    _seen.add(obj_id)
+
+    normalized_login_data_keys = {_normalize_key(item) for item in LOGIN_DATA_KEYS}
+    normalized_status_keys = {"result", "retcode", "code", "status"}
+    has_empty_value = False
+    has_error_status = False
+    has_error_text = False
+    for key, value in payload.items():
+        normalized = _normalize_key(key)
+        if normalized in normalized_login_data_keys or normalized in {"value", "ticket", "buffer"}:
+            if value in (None, "", [], {}):
+                has_empty_value = True
+        if normalized in normalized_status_keys:
+            if isinstance(value, int) and value not in (0, 200):
+                has_error_status = True
+            elif isinstance(value, str) and value.lower() not in {"", "ok", "success", "0", "200"}:
+                has_error_status = True
+        if normalized in {"errmsg", "message", "msg", "error"} and value not in (None, "", [], {}):
+            has_error_text = True
+    if has_empty_value and (has_error_status or has_error_text or "value" in payload):
+        return True
+    return any(
+        _payload_has_empty_login_data(value, _depth=_depth + 1, _seen=_seen)
+        for value in payload.values()
+        if isinstance(value, (dict, list, tuple, str))
+    )
+
+
+def _action_may_return_raw_login_data(action: str, params: dict[str, Any] | None = None) -> bool:
+    normalized_action = _normalize_key(action)
+    if normalized_action in RAW_LOGIN_DATA_ACTION_HINTS:
+        return True
+    params = params or {}
+    method = _normalize_key(params.get("method"))
+    if method in RAW_LOGIN_DATA_METHOD_HINTS:
+        return True
+    args = params.get("args")
+    if isinstance(args, (list, tuple)):
+        if any(_normalize_key(item) in RAW_LOGIN_DATA_METHOD_HINTS for item in args if isinstance(item, str)):
+            return True
+    func, _func_args = _pmhq_http_send_call(params)
+    if _normalize_key(func) in RAW_LOGIN_DATA_METHOD_HINTS:
+        return True
+    return False
+
+
+def _action_targets_rejected_login_data(action: str, params: dict[str, Any] | None = None) -> bool:
+    normalized_action = _normalize_key(action)
+    if normalized_action in REJECTED_RAW_LOGIN_DATA_ACTION_HINTS:
+        return True
+    if any(marker in normalized_action for marker in ("clientkey", "forcefetchfiletranssig")):
+        return True
+    params = params or {}
+    method = _normalize_key(params.get("method"))
+    if _is_rejected_raw_login_data_hint(method):
+        return True
+    args = params.get("args")
+    if _contains_rejected_raw_login_data_hint(args):
+        return True
+    func, _func_args = _pmhq_http_send_call(params)
+    return _is_rejected_raw_login_data_hint(_normalize_key(func))
+
+
+def _action_targets_client_key(action: str, params: dict[str, Any] | None = None) -> bool:
+    normalized_action = _normalize_key(action)
+    if "clientkey" in normalized_action:
+        return True
+    params = params or {}
+    method = _normalize_key(params.get("method"))
+    if "forcefetchclientkey" in method:
+        return True
+    args = params.get("args")
+    return _contains_normalized_marker(args, "forcefetchclientkey")
+
+
+def _contains_rejected_raw_login_data_hint(value: Any) -> bool:
+    if isinstance(value, str):
+        return _is_rejected_raw_login_data_hint(_normalize_key(value))
+    if isinstance(value, dict):
+        return any(
+            _contains_rejected_raw_login_data_hint(item)
+            for pair in value.items()
+            for item in pair
+        )
+    if isinstance(value, (list, tuple)):
+        return any(_contains_rejected_raw_login_data_hint(item) for item in value)
+    return False
+
+
+def _contains_normalized_marker(value: Any, marker: str) -> bool:
+    if isinstance(value, str):
+        return marker in _normalize_key(value)
+    if isinstance(value, dict):
+        return any(_contains_normalized_marker(item, marker) for pair in value.items() for item in pair)
+    if isinstance(value, (list, tuple)):
+        return any(_contains_normalized_marker(item, marker) for item in value)
+    return False
+
+
+def _is_rejected_raw_login_data_hint(normalized: str) -> bool:
+    return normalized in REJECTED_RAW_LOGIN_DATA_METHOD_HINTS or any(
+        marker in normalized
+        for marker in (
+            "forcefetchclientkey",
+            "forcefetchfiletranssig",
+        )
+    )
+
+
+def _action_targets_login_data(action: str, params: dict[str, Any] | None = None) -> bool:
+    """Return True when the action/params explicitly name A2/vLoginData.
+
+    Some OneBot protocol ends include ``clientKey``/``keyIndex``, PSKey/Cookie,
+    or ForceFetchFileTransSig in generic ticket responses.  Those are not
+    Tencent-upload A2.  For targeted login-misc calls, however, wrappers may
+    return bookkeeping fields next to a raw ``value``/``data`` buffer; in that
+    case the raw value is still the requested A2/vLoginData.
+    """
+
+    normalized_action = _normalize_key(action)
+    params = params or {}
+    normalized_login_keys = {_normalize_key(item) for item in (*LOGIN_MISC_DATA_KEYS, *LOGIN_DATA_KEYS)}
+
+    if normalized_action in RAW_LOGIN_DATA_ACTION_HINTS and (
+        "a2" in normalized_action or "vlogindata" in normalized_action or "logindata" in normalized_action
+    ):
+        return True
+
+    if normalized_action in {_normalize_key(item) for item in ONEBOT_LOGIN_MISC_ACTIONS}:
+        for key in ("key", "name", "field"):
+            if _normalize_key(params.get(key)) in normalized_login_keys:
+                return True
+
+    method = _normalize_key(params.get("method"))
+    if method in {"geta2", "geta2ticket", "geta2bytes", "getqquploaddata", "getqzoneuploaddata"}:
+        return True
+    args = params.get("args")
+    if isinstance(args, (list, tuple)) and args:
+        if _normalize_key(args[0]) in {
+            "nodeikernelloginservicegetloginmiscdata",
+            "nodeikernelticketservicegeta2ticket",
+            "loginservicegetloginmiscdata",
+            "wrappersessiongetloginservicegetloginmiscdata",
+            "wrappersessiongetticketservicegeta2ticket",
+        }:
+            if _normalize_key(args[0]) in {
+                "nodeikernelticketservicegeta2ticket",
+                "wrappersessiongetticketservicegeta2ticket",
+            }:
+                return True
+            values = args[1] if len(args) > 1 else []
+            if isinstance(values, (list, tuple)):
+                return any(_normalize_key(item) in normalized_login_keys for item in values)
+            return _normalize_key(values) in normalized_login_keys
+    func, func_args = _pmhq_http_send_call(params)
+    if _normalize_key(func) in {
+        "nodeikernelloginservicegetloginmiscdata",
+        "nodeikernelticketservicegeta2ticket",
+        "loginservicegetloginmiscdata",
+        "wrappersessiongetloginservicegetloginmiscdata",
+        "wrappersessiongetticketservicegeta2ticket",
+    }:
+        if _normalize_key(func) in {
+            "nodeikernelticketservicegeta2ticket",
+            "wrappersessiongetticketservicegeta2ticket",
+        }:
+            return True
+        if isinstance(func_args, (list, tuple)):
+            return any(_normalize_key(item) in normalized_login_keys for item in func_args)
+        return _normalize_key(func_args) in normalized_login_keys
+    return False
+
+
+def _pmhq_http_send_call(params: dict[str, Any] | None = None) -> tuple[str, Any]:
+    params = params or {}
+    method = _normalize_key(params.get("method"))
+    if method not in {"httpsend", "wssend"}:
+        return "", []
+    args = params.get("args")
+    if not isinstance(args, (list, tuple)) or not args or not isinstance(args[0], dict):
+        return "", []
+    data = args[0].get("data")
+    if not isinstance(data, dict):
+        return "", []
+    return str(data.get("func") or ""), data.get("args") or []
+
+
+def _extract_raw_login_data_payload(
+    payload: Any,
+    *,
+    source: str = "onebot",
+    trusted_raw: bool = False,
+) -> OneBotVideoUploadCredentials | None:
+    if _payload_has_file_trans_sig(payload):
+        return None
+    if (
+        not trusted_raw
+        and (
+            _payload_has_client_key(payload)
+            or _payload_has_web_credentials(payload)
+        )
+    ):
+        return None
+    encoded = _find_raw_login_data(payload, trusted_text=trusted_raw)
+    if not encoded:
+        return None
+    return OneBotVideoUploadCredentials(login_data_b64=encoded, source=source)
+
+
+def _find_raw_login_data(
+    payload: Any,
+    *,
+    trusted_text: bool = False,
+    _depth: int = 0,
+    _seen: set[int] | None = None,
+) -> str:
+    if _seen is None:
+        _seen = set()
+    if payload is None or _depth > 8:
+        return ""
+    if isinstance(payload, (bytes, bytearray)):
+        return _raw_scalar_to_b64(payload, trusted_text=trusted_text)
+    if isinstance(payload, str):
+        text = payload.strip()
+        if not text:
+            return ""
+        if text.startswith("{") or text.startswith("["):
+            try:
+                return _find_raw_login_data(
+                    json.loads(text),
+                    trusted_text=trusted_text,
+                    _depth=_depth + 1,
+                    _seen=_seen,
+                )
+            except Exception:
+                return ""
+        return _raw_scalar_to_b64(text, trusted_text=trusted_text)
+    if isinstance(payload, (list, tuple)):
+        if all(isinstance(item, int) for item in payload):
+            return _raw_scalar_to_b64(payload, trusted_text=trusted_text)
+        for item in payload:
+            found = _find_raw_login_data(item, trusted_text=trusted_text, _depth=_depth + 1, _seen=_seen)
+            if found:
+                return found
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+
+    buffer_like = _buffer_like_to_bytes(payload)
+    if buffer_like is not None:
+        return _raw_scalar_to_b64(buffer_like, trusted_text=trusted_text)
+
+    obj_id = id(payload)
+    if obj_id in _seen:
+        return ""
+    _seen.add(obj_id)
+    if _dict_reports_failure_status(payload):
+        return ""
+
+    normalized_client_keys = {_normalize_key(key) for key in CLIENT_KEY_KEYS}
+    normalized_web_keys = {_normalize_key(item) for item in WEB_CREDENTIAL_KEYS}
+    normalized_file_trans_sig_keys = {_normalize_key(item) for item in FILE_TRANS_SIG_KEYS}
+    for key in RAW_LOGIN_DATA_WRAPPER_KEYS:
+        normalized = _normalize_key(key)
+        if (
+            key in payload
+            and normalized not in normalized_client_keys
+            and normalized not in normalized_web_keys
+            and normalized not in normalized_file_trans_sig_keys
+        ):
+            found = _find_raw_login_data(
+                payload.get(key),
+                trusted_text=trusted_text,
+                _depth=_depth + 1,
+                _seen=_seen,
+            )
+            if found:
+                return found
+    for key, value in payload.items():
+        normalized = _normalize_key(key)
+        if (
+            normalized in normalized_client_keys
+            or normalized in normalized_web_keys
+            or normalized in normalized_file_trans_sig_keys
+        ):
+            continue
+        if normalized in {_normalize_key(item) for item in LOGIN_DATA_KEYS}:
+            found = _raw_scalar_to_b64(value, trusted_text=trusted_text)
+            if found:
+                return found
+        if isinstance(value, (dict, list, tuple)):
+            found = _find_raw_login_data(value, trusted_text=trusted_text, _depth=_depth + 1, _seen=_seen)
+            if found:
+                return found
+    return ""
+
+
+def _raw_scalar_to_b64(value: Any, *, trusted_text: bool = False) -> str:
+    encoded = _value_to_b64(value)
+    if encoded:
+        try:
+            decoded = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError):
+            return ""
+        return encoded if len(decoded) >= MIN_RAW_LOGIN_DATA_BYTES else ""
+    if trusted_text:
+        raw = _trusted_raw_text_to_bytes(value)
+        if len(raw) >= MIN_RAW_LOGIN_DATA_BYTES:
+            return _bytes_to_b64(raw)
+    return ""
+
+
+def _trusted_raw_text_to_bytes(value: Any) -> bytes:
+    """Encode targeted getLoginMiscData raw string values without accepting printable tokens.
+
+    Some NTQQ bridges expose binary login misc data as a JavaScript string
+    instead of hex/base64/Buffer.  Only targeted A2/vLoginData calls reach this
+    branch, and we still require non-printable or non-ASCII characters so Web
+    clientKey-like printable strings are not treated as QQ upload material.
+    """
+
+    if not isinstance(value, str):
+        return b""
+    text = value.strip()
+    if not text:
+        return b""
+    if not _looks_like_binary_text(text):
+        return b""
+    try:
+        if all(ord(ch) <= 0xFF for ch in text):
+            return bytes(ord(ch) for ch in text)
+        return text.encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError):
+        return b""
+
+
+def _looks_like_binary_text(text: str) -> bool:
+    return any((ord(ch) < 32 and ch not in "\r\n\t") or ord(ch) > 126 for ch in text)
+
+
+def _value_to_b64(value: Any) -> str:
+    if value is None:
+        return ""
+    buffer_like = _buffer_like_to_bytes(value)
+    if buffer_like is not None:
+        return _bytes_value_to_b64(buffer_like)
+    if isinstance(value, bytes):
+        return _bytes_value_to_b64(value)
+    if isinstance(value, bytearray):
+        return _bytes_value_to_b64(bytes(value))
+    if isinstance(value, memoryview):
+        return _bytes_value_to_b64(value.tobytes())
+    if isinstance(value, list) and all(isinstance(item, int) for item in value):
+        try:
+            return _bytes_value_to_b64(bytes(item & 0xFF for item in value))
+        except ValueError:
+            return ""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if _looks_like_login_data_error_text(text):
+        return ""
+    if text.startswith("base64://"):
+        text = text[len("base64://") :]
+    if HEX_RE.match(text):
+        raw = text[2:] if text.lower().startswith("0x") else text
+        if len(raw) % 2 == 0:
+            try:
+                return _bytes_to_b64(bytes.fromhex(raw))
+            except ValueError:
+                return ""
+    try:
+        decoded = base64.b64decode("".join(text.split()), validate=True)
+    except (binascii.Error, ValueError):
+        compact = "".join(text.split())
+        if "-" not in compact and "_" not in compact:
+            return ""
+        padded = compact + "=" * ((4 - len(compact) % 4) % 4)
+        try:
+            decoded = base64.urlsafe_b64decode(padded)
+        except (binascii.Error, ValueError):
+            return ""
+    if _bytes_look_like_login_data_error_text(decoded):
+        return ""
+    return _bytes_to_b64(decoded) if decoded else ""
+
+
+def _bytes_value_to_b64(value: bytes) -> str:
+    data = bytes(value or b"")
+    if _bytes_look_like_login_data_error_text(data):
+        return ""
+    return _bytes_to_b64(data)
+
+
+def _dict_reports_failure_status(payload: dict[str, Any]) -> bool:
+    for key, value in payload.items():
+        normalized = _normalize_key(key)
+        if normalized in {"result", "ret", "retcode", "code", "errno", "err"}:
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, int) and value not in (0, 200):
+                return True
+            if isinstance(value, str):
+                text = value.strip().lower()
+                if text and text not in {"0", "200", "ok", "success"}:
+                    return True
+        if normalized == "status":
+            text = str(value or "").strip().lower()
+            if text and text not in {"0", "200", "ok", "success", "done"}:
+                return True
+    return False
+
+
+def _looks_like_login_data_error_text(text: str) -> bool:
+    lowered = str(text or "").strip().lower()
+    if not lowered:
+        return False
+    return any(
+        marker in lowered
+        for marker in (
+            "error:",
+            " failed",
+            "failed:",
+            "not available",
+            "not a function",
+            "no method",
+            "unsupported",
+            "timeout",
+            "娌℃湁鏂规硶",
+            "涓嶆敮鎸?",
+            "澶辫触",
+        )
+    )
+
+
+def _bytes_look_like_login_data_error_text(value: bytes) -> bool:
+    data = bytes(value or b"")
+    if not data:
+        return False
+    printable = sum(1 for item in data if item in (9, 10, 13) or 32 <= item <= 126)
+    if printable / len(data) < 0.85:
+        return False
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        text = data.decode("latin1", errors="ignore")
+    return _looks_like_login_data_error_text(text)
+
+
+def _buffer_like_to_bytes(value: Any) -> bytes | None:
+    if not isinstance(value, dict):
+        return None
+    data = value.get("data")
+    type_name = _normalize_key(value.get("type"))
+    if isinstance(data, (list, tuple)) and all(isinstance(item, int) for item in data):
+        if type_name in {"buffer", "uint8array", "bytes", "bytearray"} or set(value).issubset({"type", "data"}):
+            try:
+                return bytes(item & 0xFF for item in data)
+            except ValueError:
+                return None
+    numeric_items: list[tuple[int, int]] = []
+    for key, item in value.items():
+        if not str(key).isdigit() or not isinstance(item, int):
+            numeric_items = []
+            break
+        numeric_items.append((int(key), item))
+    if numeric_items and {index for index, _ in numeric_items} == set(range(len(numeric_items))):
+        try:
+            return bytes(item & 0xFF for _, item in sorted(numeric_items))
+        except ValueError:
+            return None
+    return None
+
+
+def _bytes_to_b64(value: bytes) -> str:
+    data = bytes(value or b"")
+    return base64.b64encode(data).decode("ascii") if data else ""
+
+
+def _normalize_key(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+
+
+def _as_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default

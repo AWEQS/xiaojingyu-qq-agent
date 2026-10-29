@@ -1,0 +1,77 @@
+{
+  "enabled": {
+    "description": "总开关",
+    "type": "bool",
+    "default": true
+  },
+  "stickers_dir": {
+    "description": "表情库目录",
+    "type": "string",
+    "default": "",
+    "hint": "留空则用插件自带 stickers/ 目录"
+  },
+  "list_limit": {
+    "description": "注入提示词的表情数量上限",
+    "type": "int",
+    "default": 10,
+    "slider": {
+      "min": 1,
+      "max": 50,
+      "step": 1
+    }
+  },
+  "max_per_reply": {
+    "description": "单条回复最多发几个表情",
+    "type": "int",
+    "default": 1,
+    "slider": {
+      "min": 1,
+      "max": 3,
+      "step": 1
+    }
+  },
+  "delay_ms": {
+    "description": "表情与文字之间的间隔（毫秒）",
+    "type": "int",
+    "default": 500
+  },
+  "auto_sticker_enabled": {
+    "description": "智能发表情（语境/情绪）",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后每条回复额外调用一次小模型，判断该不该发表情、发哪张；话题严肃/悲伤时不会发"
+  },
+  "auto_sticker_rate": {
+    "description": "表情出现频率上限（%）",
+    "type": "int",
+    "default": 35,
+    "slider": {
+      "min": 0,
+      "max": 100,
+      "step": 5
+    },
+    "hint": "每条回复最多按这个概率尝试发表情；0 = 不自动发"
+  },
+  "auto_sticker_cooldown_sec": {
+    "description": "同会话表情冷却（秒）",
+    "type": "int",
+    "default": 120,
+    "slider": {
+      "min": 0,
+      "max": 600,
+      "step": 10
+    },
+    "hint": "同一群/同一人两次自动表情之间的最小间隔"
+  },
+  "auto_sticker_candidates": {
+    "description": "候选表情数量",
+    "type": "int",
+    "default": 28,
+    "slider": {
+      "min": 5,
+      "max": 60,
+      "step": 1
+    },
+    "hint": "按语境关键词从库里挑多少张给模型选，太多会费 token"
+  }
+}

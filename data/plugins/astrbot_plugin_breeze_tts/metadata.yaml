@@ -1,0 +1,6 @@
+name: astrbot_plugin_breeze_tts
+display_name: 语音（Breeze TTS 2）
+desc: 用 BreezeBlue Breeze TTS 2 云端接口发语音，音色在控制台克隆/切换/删除。
+version: 0.1.0
+author: dsh-agent
+entry: main.py

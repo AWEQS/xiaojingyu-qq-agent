@@ -1,0 +1,53 @@
+# --- 运行时数据（含聊天/档案/凭据，绝不入库） ---
+data/backups/
+data/attachments/
+data/plugin_data/
+data/console/
+data/config/
+data/knowledge_base/
+data/cmd_config.json
+data/data_v4.db
+data/plugins/*/memory/
+data/plugins/*/chat_images/
+data/plugins/*/personas/.history/
+data/plugins/*/personas/.pending/
+data/plugins/*/stickers/.trash/
+data/plugins/*/state.json
+data/plugins/*/groups.json
+data/plugins/*/chat_history.json
+data/plugins/*/bot_history.json
+data/plugins/*/relationship.json
+data/plugins/*/daily_state.json
+data/plugins/*/life_timeline.json
+data/plugins/*/signature_state.json
+data/plugins/*/qzone_post_state.json
+data/plugins/*/proactive_state.json
+data/plugins/*/proactive_overrides.json
+napcat/
+napcat-installer/
+mock/edge-profile*/
+*.log
+
+# --- 大体积依赖/缓存（可重建） ---
+cache/
+tools/
+python/
+llama/
+models/
+desktop/electron/
+desktop/electron-v40*.zip
+dist/
+
+# --- 其它 ---
+__pycache__/
+*.pyc
+.venv/
+desktop/settings.json
+# --- 误入的旧运行时副本 / 归档包 ---
+desktop/electron-old-mixed/
+mock/*.zip
+
+# --- 插件运行时状态（机器人每次运行都会写，不能入库）---
+data/plugins/*/weather_state.json
+data/plugins/*/policy.json
+data/plugins/*/*_state.json

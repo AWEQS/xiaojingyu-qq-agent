@@ -1,0 +1,7114 @@
+"""AstrBot entry point for the QQ 空间 bridge."""
+
+# ruff: noqa: E402
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import importlib.util
+import os
+import inspect
+import json
+import random
+import re
+import shutil
+import sys
+import time
+from contextlib import contextmanager
+from datetime import datetime
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, Iterable, Iterator
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+
+from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.star import Context, Star
+
+try:
+    from quart import jsonify as _quart_jsonify
+    from quart import request as _quart_request
+    from quart import Response as _quart_response_class
+except Exception:
+    _quart_jsonify = None
+    _quart_request = None
+    _quart_response_class = None
+
+PLUGIN_ROOT = Path(__file__).resolve().parent
+PLUGIN_DATA_NAME_FALLBACK = "astrbot_plugin_qzone_ultra"
+REQUIRED_QZONE_BRIDGE_API_VERSION = 2026061301
+LEGACY_MIGRATION_FILES = ("state.json", "drafts.json", "posts.json", "auto_comment_state.json")
+LEGACY_MIGRATION_SENTINEL = ".legacy-qzone-migration.json"
+LEGACY_MIGRATION_LOCK = ".legacy-qzone-migration.lock"
+AUTO_BIND_RETRY_ATTEMPTS = 3
+AUTO_BIND_RETRY_DELAY_SECONDS = 1.0
+UNKNOWN_POST_TIME_TEXT = "未知时间"
+
+SENSITIVE_LOG_KEYS = {
+    "cookie",
+    "cookies",
+    "p_skey",
+    "skey",
+    "pt4_token",
+    "pt_key",
+    "qzonetoken",
+    "secret",
+    "token",
+}
+SENSITIVE_URL_QUERY_KEYS = {
+    "g_tk",
+    "gtk",
+    "p_skey",
+    "skey",
+    "pt4_token",
+    "pt_key",
+    "qzonetoken",
+    "token",
+    "secret",
+    "rkey",
+    "rk",
+    "lvkey",
+}
+LLM_INTERNAL_KEYS = SENSITIVE_LOG_KEYS | {"raw", "cursor", "fid", "curkey", "unikey", "busi_param"}
+LLM_REPLY_FORBIDDEN_TERMS = (
+    "Result:",
+    "result:",
+    "[TOOL_",
+    "TOOL_",
+    "qzone_",
+    "qzone_like_post",
+    "qzone_comment_post",
+    "qzone_publish_post",
+    "qzone_view_post",
+    "qzone_delete_post",
+    "JSON",
+    "json",
+    "Markdown",
+    "markdown",
+    "字段",
+    "fid",
+    "hostuin",
+    "status_code",
+    "diagnostic",
+    "API",
+    "api",
+    "工具",
+    "系统",
+    "后台",
+    "参数",
+    "指令",
+    "命令",
+    "内部",
+    "错误代码",
+    "状态码",
+    "生成",
+    "绘制",
+    "绘图",
+    "渲染",
+    "处理完成",
+    "任务完成",
+    "已发送",
+)
+
+
+def _redact_url(value: str) -> str:
+    try:
+        parsed = urlparse(value)
+    except Exception:
+        return value
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        return value
+    query = []
+    changed = False
+    for key, item_value in parse_qsl(parsed.query, keep_blank_values=True):
+        lowered = key.lower()
+        if lowered in SENSITIVE_URL_QUERY_KEYS or "token" in lowered or "skey" in lowered:
+            query.append((key, "***"))
+            changed = True
+        else:
+            query.append((key, item_value))
+    if not changed:
+        return value
+    return urlunparse(parsed._replace(query=urlencode(query, doseq=True)))
+
+
+def _redact_for_log(value: Any) -> Any:
+    if isinstance(value, dict):
+        redacted: dict[str, Any] = {}
+        for key, item in value.items():
+            key_text = str(key)
+            lowered = key_text.lower()
+            if lowered in SENSITIVE_LOG_KEYS or "cookie" in lowered or "skey" in lowered or "secret" in lowered:
+                redacted[key_text] = "***"
+            else:
+                redacted[key_text] = _redact_for_log(item)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_for_log(item) for item in value]
+    if isinstance(value, tuple):
+        return [_redact_for_log(item) for item in value]
+    if isinstance(value, str):
+        return _redact_url(value)
+    return value
+
+
+TOOL_LOG_REDACT_KEYS = {
+    "busi_param",
+    "comment",
+    "comments",
+    "content",
+    "curkey",
+    "fid",
+    "images",
+    "items",
+    "media",
+    "post",
+    "raw",
+    "summary",
+    "text",
+    "unikey",
+}
+TOOL_LOG_COUNT_KEYS = {"comments", "images", "items", "media"}
+
+
+def _safe_for_tool_log(value: Any, *, key: str = "") -> Any:
+    lowered = key.lower()
+    if lowered in TOOL_LOG_COUNT_KEYS and isinstance(value, (list, tuple)):
+        return {"count": len(value)}
+    if (
+        lowered in TOOL_LOG_REDACT_KEYS
+        or lowered in SENSITIVE_LOG_KEYS
+        or "cookie" in lowered
+        or "skey" in lowered
+        or "secret" in lowered
+        or "token" in lowered
+    ):
+        if isinstance(value, (dict, list, tuple)):
+            try:
+                return {"redacted": True, "count": len(value)}
+            except Exception:
+                return "[redacted]"
+        return "[redacted]"
+    if isinstance(value, dict):
+        return {str(item_key): _safe_for_tool_log(item, key=str(item_key)) for item_key, item in value.items()}
+    if isinstance(value, list):
+        return [_safe_for_tool_log(item) for item in value]
+    if isinstance(value, tuple):
+        return [_safe_for_tool_log(item) for item in value]
+    if isinstance(value, str):
+        return truncate(_redact_url(value), 180)
+    return value
+
+
+def _safe_for_llm(value: Any) -> Any:
+    if isinstance(value, dict):
+        visible: dict[str, Any] = {}
+        for key, item in value.items():
+            key_text = str(key)
+            lowered = key_text.lower()
+            if (
+                lowered in LLM_INTERNAL_KEYS
+                or "cookie" in lowered
+                or "skey" in lowered
+                or "secret" in lowered
+                or "token" in lowered
+            ):
+                continue
+            visible[key_text] = _safe_for_llm(item)
+        return visible
+    if isinstance(value, list):
+        return [_safe_for_llm(item) for item in value]
+    if isinstance(value, tuple):
+        return [_safe_for_llm(item) for item in value]
+    if isinstance(value, str):
+        return truncate(_redact_url(value), 500)
+    if isinstance(value, (bool, int, float)) or value is None:
+        return value
+    return truncate(str(value), 500)
+
+
+def _public_error_reason(message: Any) -> str:
+    text = str(message or "").strip()
+    text = re.sub(r"^\s*(?:Result|结果)\s*[:：]\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"^\s*\[[A-Z0-9_:-]+\]\s*", "", text)
+    text = re.split(r"(?:\n|【对话要求】|请用|严格禁止|不要提)", text, maxsplit=1)[0].strip()
+    text = text.strip(" \t\r\n:：-—")
+    if not text:
+        return "现在还没办法继续"
+    return truncate(text, 80)
+
+
+def _public_error_detail_parts(detail: Any) -> list[str]:
+    if not isinstance(detail, dict):
+        return []
+    parts: list[str] = []
+    status_code = detail.get("status_code")
+    if status_code is not None:
+        parts.append(f"HTTP {status_code}")
+    returncode = detail.get("returncode")
+    if returncode is not None:
+        parts.append(f"退出码 {returncode}")
+    daemon_port = detail.get("daemon_port")
+    if daemon_port:
+        parts.append(f"daemon 端口 {daemon_port}")
+    location = detail.get("location")
+    if location:
+        parts.append(f"跳转 {_redact_url(str(location))}")
+    url = detail.get("url")
+    if url:
+        parts.append(f"地址 {_redact_url(str(url))}")
+    if detail.get("log_path"):
+        parts.append("daemon 日志可在插件数据目录查看")
+    trust_env = detail.get("trust_env")
+    if trust_env is False:
+        parts.append("未使用系统代理")
+    attempts = detail.get("attempts")
+    if isinstance(attempts, list) and attempts:
+        parts.append(f"启动尝试 {len(attempts)} 次")
+        last_attempt = attempts[-1]
+        if isinstance(last_attempt, dict):
+            parts.extend(_public_error_detail_parts(last_attempt))
+    errors = detail.get("errors")
+    if isinstance(errors, list) and errors:
+        first_error = errors[0]
+        if isinstance(first_error, dict):
+            reason = _public_error_reason(first_error.get("message"))
+            if reason:
+                parts.append(reason)
+            error_url = first_error.get("url")
+            if error_url:
+                parts.append(f"地址 {_redact_url(str(error_url))}")
+            error_status = first_error.get("status_code")
+            if error_status is not None:
+                parts.append(f"HTTP {error_status}")
+        else:
+            reason = _public_error_reason(first_error)
+            if reason:
+                parts.append(reason)
+    if detail.get("text") or detail.get("raw") or detail.get("log_tail"):
+        parts.append("响应详情已隐藏")
+    return parts
+
+
+def _chmod_private(path: Path) -> None:
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def _chmod_private_dir(path: Path) -> None:
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
+
+
+def _path_contains(parent: Path, child: Path) -> bool:
+    try:
+        child.resolve(strict=False).relative_to(parent.resolve(strict=False))
+        return True
+    except Exception:
+        return False
+
+
+@contextmanager
+def _migration_lock(data_dir: Path) -> Iterator[None]:
+    data_dir.mkdir(parents=True, exist_ok=True)
+    _chmod_private_dir(data_dir)
+    lock_path = data_dir / LEGACY_MIGRATION_LOCK
+    with lock_path.open("a+b") as lock_file:
+        lock_file.seek(0)
+        if not lock_file.read(1):
+            lock_file.write(b"\0")
+            lock_file.flush()
+        lock_file.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _read_plugin_name(plugin_root: Path) -> str:
+    metadata = plugin_root / "metadata.yaml"
+    try:
+        for line in metadata.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("name:"):
+                continue
+            value = stripped.split(":", 1)[1].strip().strip("'\"")
+            if value:
+                return value
+    except Exception:
+        pass
+    return PLUGIN_DATA_NAME_FALLBACK
+
+
+def _star_tools_data_dir(plugin_name: str) -> Path | None:
+    try:
+        from astrbot.api.star import StarTools
+    except ImportError as exc:
+        logger.warning("qzone StarTools unavailable; using legacy data dir: %s", exc)
+        return None
+    try:
+        return Path(StarTools.get_data_dir(plugin_name))
+    except Exception as exc:
+        logger.warning("qzone StarTools data dir unavailable; using legacy data dir: %s", exc)
+        return None
+
+
+def _safe_copy_legacy_file(source: Path, target: Path, *, legacy_root: Path, data_dir: Path) -> str:
+    if source.is_symlink():
+        return "skipped_symlink"
+    if not source.is_file():
+        return "skipped_not_file"
+    if not _path_contains(legacy_root, source):
+        return "skipped_source_outside_legacy"
+    if not _path_contains(data_dir, target):
+        return "skipped_target_outside_data_dir"
+    if target.exists():
+        return "skipped_target_exists"
+    tmp = target.with_name(f"{target.name}.tmp.{int(time.time() * 1000)}.{random.randrange(1000000):06d}")
+    try:
+        shutil.copyfile(source, tmp)
+        _chmod_private(tmp)
+        tmp.replace(target)
+        _chmod_private(target)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except Exception:
+                pass
+    return "copied"
+
+
+def _write_json_private(path: Path, payload: dict[str, Any]) -> None:
+    tmp = path.with_name(f"{path.name}.tmp.{int(time.time() * 1000)}.{random.randrange(1000000):06d}")
+    try:
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+        _chmod_private(tmp)
+        tmp.replace(path)
+        _chmod_private(path)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except Exception:
+                pass
+
+
+def _migrate_legacy_data_dir(legacy_dir: Path, data_dir: Path) -> None:
+    try:
+        legacy = legacy_dir.resolve()
+        target = data_dir.resolve()
+    except Exception:
+        legacy = legacy_dir
+        target = data_dir
+    if legacy == target or not legacy_dir.exists() or not legacy_dir.is_dir():
+        return
+    try:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        _chmod_private_dir(data_dir)
+    except Exception as exc:
+        logger.warning("qzone standard data dir is not writable: %s", exc)
+        return
+    try:
+        with _migration_lock(data_dir):
+            sentinel = data_dir / LEGACY_MIGRATION_SENTINEL
+            if sentinel.exists():
+                try:
+                    marker = json.loads(sentinel.read_text(encoding="utf-8"))
+                    if isinstance(marker, dict) and marker.get("complete") is True:
+                        return
+                except Exception:
+                    pass
+            results: dict[str, str] = {}
+            for name in LEGACY_MIGRATION_FILES:
+                source = legacy_dir / name
+                if not source.exists():
+                    results[name] = "skipped_missing"
+                    continue
+                try:
+                    results[name] = _safe_copy_legacy_file(
+                        source,
+                        data_dir / name,
+                        legacy_root=legacy_dir,
+                        data_dir=data_dir,
+                    )
+                except Exception as exc:
+                    results[name] = f"failed_{type(exc).__name__}"
+                    logger.warning("qzone legacy data migration skipped %s: %s", name, exc)
+            payload = {
+                "complete": not any(status.startswith("failed_") for status in results.values()),
+                "completed_at": datetime.now().isoformat(timespec="seconds"),
+                "legacy_dir": str(legacy_dir),
+                "data_dir": str(data_dir),
+                "files": results,
+                "legacy_cleanup_recommended": True,
+            }
+            _write_json_private(sentinel, payload)
+            try:
+                (legacy_dir / ".migrated-to-astrbot-data").write_text(
+                    f"Copied supported Qzone data files to {data_dir} at {payload['completed_at']}.\n"
+                    "Review the standard data directory, then remove old sensitive files here if no rollback is needed.\n",
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
+            if any(status == "copied" for status in results.values()):
+                logger.warning("qzone legacy data copied to AstrBot data dir; review and remove old data/qzone when safe")
+    except Exception as exc:
+        logger.warning("qzone legacy data migration failed: %s", exc)
+
+
+def _standard_data_dir(plugin_root: Path) -> Path:
+    plugin_name = _read_plugin_name(plugin_root)
+    data_dir = _star_tools_data_dir(plugin_name)
+    if data_dir is None:
+        data_dir = plugin_root / "data" / "plugin_data" / plugin_name
+    _migrate_legacy_data_dir(plugin_root / "data" / "qzone", data_dir)
+    try:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        _chmod_private_dir(data_dir)
+    except Exception as exc:
+        logger.warning("qzone standard data dir is not writable: %s", exc)
+    return data_dir
+
+
+def _local_qzone_bridge_root() -> Path:
+    package_root = (PLUGIN_ROOT / "qzone_bridge").resolve(strict=False)
+    package_init = package_root / "__init__.py"
+    if not package_init.is_file():
+        raise RuntimeError(f"qzone_bridge package is missing: {package_init}")
+    return package_root
+
+
+def _verify_local_qzone_bridge_module(name: str, package_root: Path) -> None:
+    module = sys.modules.get(name)
+    if module is None:
+        return
+    module_file = getattr(module, "__file__", None)
+    if not module_file:
+        raise RuntimeError(f"{name} is already loaded without a file path")
+    package_path = Path(module_file).resolve(strict=False)
+    if not _path_contains(package_root, package_path):
+        raise RuntimeError(f"{name} resolved outside plugin directory: {package_path}")
+
+
+def _qzone_bridge_contract_is_current(package_root: Path) -> bool:
+    package = sys.modules.get("qzone_bridge")
+    if package is None:
+        return False
+    _verify_local_qzone_bridge_module("qzone_bridge", package_root)
+    expected_version = _local_qzone_bridge_expected_version(package_root)
+    if expected_version and str(getattr(package, "__version__", "") or "") != expected_version:
+        return False
+    try:
+        if int(getattr(package, "BRIDGE_API_VERSION", 0) or 0) < REQUIRED_QZONE_BRIDGE_API_VERSION:
+            return False
+    except (TypeError, ValueError):
+        return False
+
+    contract_methods = {
+        "qzone_bridge.drafts": {"DraftStore": ("add_async", "get_async", "list_async", "update_async")},
+        "qzone_bridge.llm": {"QzoneLLM": ("generate_news_post_text",)},
+        "qzone_bridge.posts": {"PostStore": ("get_async", "list_async", "upsert_async")},
+        "qzone_bridge.settings": {"PluginSettings": ("from_mapping",)},
+        "qzone_bridge.json_store": {"AtomicItemStoreFile": ("read_async", "write_async", "transact_async")},
+    }
+    for module_name, classes in contract_methods.items():
+        module = sys.modules.get(module_name)
+        if module is None:
+            continue
+        _verify_local_qzone_bridge_module(module_name, package_root)
+        for class_name, methods in classes.items():
+            cls = getattr(module, class_name, None)
+            if cls is None:
+                return False
+            for method_name in methods:
+                if not callable(getattr(cls, method_name, None)):
+                    return False
+
+    contract_attributes = {
+        "qzone_bridge.media": (
+            "base64_media_source",
+            "collapse_single_video_cover_companion_media",
+            "collect_message_media",
+            "collect_post_payload",
+            "parse_cq_message",
+        ),
+        "qzone_bridge.page_api": ("PAGE_DETAIL_TIMEOUT_SECONDS", "PAGE_STATUS_TIMEOUT_SECONDS"),
+        "qzone_bridge.publish_renderer": ("combine_rendered_post_cards", "SUPPORTS_COMMENT_RESULT_SECTIONS"),
+        "qzone_bridge.social": ("extract_nickname",),
+    }
+    for module_name, attributes in contract_attributes.items():
+        module = sys.modules.get(module_name)
+        if module is None:
+            continue
+        _verify_local_qzone_bridge_module(module_name, package_root)
+        for attribute in attributes:
+            value = getattr(module, attribute, None)
+            if value is None:
+                return False
+            if attribute == "SUPPORTS_COMMENT_RESULT_SECTIONS" and value is not True:
+                return False
+
+    contract_class_attributes = {
+        "qzone_bridge.selection": {"PostSelection": ("has_explicit_input",)},
+    }
+    for module_name, classes in contract_class_attributes.items():
+        module = sys.modules.get(module_name)
+        if module is None:
+            continue
+        _verify_local_qzone_bridge_module(module_name, package_root)
+        for class_name, attributes in classes.items():
+            cls = getattr(module, class_name, None)
+            if cls is None:
+                return False
+            for attribute in attributes:
+                if getattr(cls, attribute, None) is None:
+                    return False
+
+    contract_dataclass_fields = {
+        "qzone_bridge.settings": {
+            "PluginSettings": (
+                "news_cron",
+                "news_offset",
+                "news_provider_id",
+                "news_prompt",
+                "news_scopes",
+                "news_keywords",
+                "news_custom_rss_urls",
+                "news_max_candidates",
+                "news_recency_hours",
+                "news_once_per_day",
+                "news_max_post_length",
+                "news_trust_env",
+                "native_video_publish",
+                "life_publish_enabled",
+                "life_publish_use_life_context",
+                "life_publish_use_llm_image_prompt",
+                "life_publish_use_omnidraw_selfie",
+                "life_publish_auto_caption",
+                "life_publish_mode",
+                "life_publish_failure_policy",
+                "life_publish_aspect_ratio",
+                "life_publish_size",
+                "life_publish_extra_params",
+                "life_publish_static_caption",
+                "life_publish_image_prompt_template",
+                "life_publish_caption_prompt",
+            )
+        },
+    }
+    for module_name, classes in contract_dataclass_fields.items():
+        module = sys.modules.get(module_name)
+        if module is None:
+            continue
+        _verify_local_qzone_bridge_module(module_name, package_root)
+        for class_name, fields in classes.items():
+            cls = getattr(module, class_name, None)
+            if cls is None:
+                return False
+            dataclass_fields = getattr(cls, "__dataclass_fields__", None)
+            if not isinstance(dataclass_fields, dict):
+                return False
+            for field_name in fields:
+                if field_name not in dataclass_fields:
+                    return False
+
+    signature_contracts = {
+        "qzone_bridge.controller": {"QzoneDaemonController.list_feeds": "record_recent"},
+        "qzone_bridge.daemon": {"QzoneDaemonService.list_feeds": "record_recent"},
+        "qzone_bridge.page_api": {"QzonePageApi.__init__": "preload_scheduler"},
+    }
+    for module_name, members in signature_contracts.items():
+        module = sys.modules.get(module_name)
+        if module is None:
+            continue
+        _verify_local_qzone_bridge_module(module_name, package_root)
+        for dotted_name, parameter in members.items():
+            target: Any = module
+            for part in dotted_name.split("."):
+                target = getattr(target, part, None)
+                if target is None:
+                    return False
+            try:
+                if parameter not in inspect.signature(target).parameters:
+                    return False
+            except (TypeError, ValueError):
+                return False
+    return True
+
+
+def _local_qzone_bridge_expected_version(package_root: Path) -> str:
+    try:
+        text = (package_root / "__init__.py").read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    match = re.search(r"(?m)^__version__\s*=\s*['\"]([^'\"]+)['\"]", text)
+    return match.group(1).strip() if match else ""
+
+
+def _evict_local_qzone_bridge_modules(package_root: Path) -> None:
+    names = [
+        name
+        for name in sys.modules
+        if name == "qzone_bridge" or name.startswith("qzone_bridge.")
+    ]
+    for name in sorted(names, key=lambda item: item.count("."), reverse=True):
+        _verify_local_qzone_bridge_module(name, package_root)
+        sys.modules.pop(name, None)
+
+
+def _load_local_qzone_bridge_package() -> None:
+    package_root = _local_qzone_bridge_root()
+    for name in tuple(sys.modules):
+        if name == "qzone_bridge" or name.startswith("qzone_bridge."):
+            _verify_local_qzone_bridge_module(name, package_root)
+
+    if "qzone_bridge" in sys.modules and _qzone_bridge_contract_is_current(package_root):
+        return
+    if "qzone_bridge" in sys.modules:
+        _evict_local_qzone_bridge_modules(package_root)
+
+    package_init = package_root / "__init__.py"
+    spec = importlib.util.spec_from_file_location(
+        "qzone_bridge",
+        package_init,
+        submodule_search_locations=[str(package_root)],
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"unable to load qzone_bridge package from {package_init}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["qzone_bridge"] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        if sys.modules.get("qzone_bridge") is module:
+            sys.modules.pop("qzone_bridge", None)
+        raise
+    _verify_local_qzone_bridge_module("qzone_bridge", package_root)
+
+
+_load_local_qzone_bridge_package()
+
+from qzone_bridge.auto_comment import (
+    AutoCommentPipeline,
+    AutoCommentPipelineConfig,
+    AutoCommentPipelineResult,
+    AutoCommentStateStore,
+)
+from qzone_bridge.controller import QzoneDaemonController
+from qzone_bridge.drafts import DraftPost, DraftStore
+from qzone_bridge.errors import (
+    DaemonUnavailableError,
+    QzoneBridgeError,
+    QzoneCookieAcquireError,
+    QzoneNeedsRebind,
+    QzoneParseError,
+)
+from qzone_bridge.llm import QzoneLLM
+from qzone_bridge.local_media import resolve_trusted_local_media_path
+from qzone_bridge.media import (
+    MEDIA_BASE64_SOURCE_KEYS,
+    MEDIA_LOCAL_SOURCE_KEYS,
+    MEDIA_URL_SOURCE_KEYS,
+    PostMedia,
+    PostPayload,
+    QZONE_VIDEO_SUFFIXES,
+    base64_media_source,
+    collapse_single_video_cover_companion_media,
+    collect_message_media,
+    collect_post_payload,
+    guess_mime_type,
+    is_video_media,
+    iter_event_components,
+    iter_reference_message_ids,
+    normalize_media_list,
+    normalize_source,
+    parse_cq_message,
+    source_name,
+)
+from qzone_bridge.models import FeedEntry
+from qzone_bridge.news import (
+    GoogleNewsRSSClient,
+    NewsItem,
+    filter_recent_news,
+    google_news_rss_urls,
+    is_news_copy_like,
+    merge_news_items,
+    normalize_news_scopes,
+)
+from qzone_bridge.onebot_cookie import (
+    COOKIE_ACTIONS,
+    ONEBOT_ACTION_CALLER_ATTRS,
+    ONEBOT_ACTION_OWNER_ATTRS,
+    fetch_cookie_text,
+    iter_onebot_action_callers,
+)
+from qzone_bridge.parser import normalize_uin, parse_cookie_text
+from qzone_bridge.page_api import QzonePageApi, page_error_payload
+from qzone_bridge.page_media import open_page_media_stream
+from qzone_bridge.post_service import QzonePostService
+from qzone_bridge.posts import PostStore
+from qzone_bridge.video import materialize_video_covers, materialize_video_sources
+import qzone_bridge.publish_renderer as _publish_renderer
+try:
+    import qzone_bridge.compat as _bridge_compat
+except Exception:
+    _bridge_compat = None
+from qzone_bridge.render import (
+    format_action_result,
+    format_feed_detail,
+    format_feed_list,
+    format_like_result,
+    format_llm_feed_list,
+    format_status,
+)
+from qzone_bridge.scheduler import cron_delay_seconds
+import qzone_bridge.selection as _selection
+from qzone_bridge.settings import PluginSettings
+import qzone_bridge.social as _social
+from qzone_bridge.utils import truncate
+
+
+class LifePublishResult(dict):
+    """Publish payload with the rendered source post attached for command feedback."""
+
+    def __init__(self, payload: dict[str, Any], post: PostPayload):
+        super().__init__(payload)
+        self.post = post
+
+
+class _CompatRenderProfile:
+    def __init__(self, nickname: str = "", user_id: str = "", avatar_source: str = "", time_text: str = ""):
+        self.nickname = nickname
+        self.user_id = user_id
+        self.avatar_source = avatar_source
+        self.time_text = time_text
+
+
+def _profile_from_event_fallback(event: Any) -> Any:
+    nickname = ""
+    for getter_name in ("get_sender_name", "get_sender_nickname"):
+        getter = getattr(event, getter_name, None)
+        if callable(getter):
+            try:
+                nickname = str(getter() or "").strip()
+            except Exception:
+                nickname = ""
+            if nickname:
+                break
+    return RenderProfile(nickname=nickname or "QQ Space", time_text=datetime.now().strftime("%H:%M"))
+
+
+def _missing_publish_renderer(*args: Any, **kwargs: Any) -> Path:
+    raise RuntimeError("qzone publish renderer is unavailable; falling back to text")
+
+
+RenderProfile = getattr(_publish_renderer, "RenderProfile", _CompatRenderProfile)
+cached_avatar_source = getattr(_publish_renderer, "cached_avatar_source", lambda cache_dir, profile: "")
+preload_static_render_assets = getattr(_publish_renderer, "preload_static_render_assets", lambda: None)
+profile_from_event = getattr(_publish_renderer, "profile_from_event", _profile_from_event_fallback)
+render_publish_result_image = getattr(_publish_renderer, "render_publish_result_image", _missing_publish_renderer)
+preload_publish_render_assets = getattr(
+    _publish_renderer,
+    "preload_publish_render_assets",
+    lambda profile, cache_dir, **kwargs: profile,
+)
+
+PostSelection = _selection.PostSelection
+parse_post_selection = _selection.parse_post_selection
+selection_from_tool_args = _selection.selection_from_tool_args
+
+QzoneComment = _social.QzoneComment
+QzonePost = _social.QzonePost
+post_from_entry = _social.post_from_entry
+
+
+def _post_contains_video_media(post: PostPayload) -> bool:
+    return any(is_video_media(item) for item in [*post.media, *post.attachments])
+
+
+def _clean_nickname_fallback(value: Any, *, hostuin: int = 0) -> str:
+    text = re.sub(r"<[^>]+>", "", re.sub(r"\[em\].*?\[/em\]", "", str(value or ""))).strip()
+    if not text or (hostuin and text == str(hostuin)) or re.fullmatch(r"\d{5,}", text):
+        return ""
+    return text
+
+
+def _extract_nickname_compat(raw: dict[str, Any] | None, *, hostuin: int = 0) -> str:
+    helper = getattr(_bridge_compat, "extract_nickname_compat", None)
+    if callable(helper):
+        return helper(raw, hostuin=hostuin, social_module=_social)
+    extractor = getattr(_social, "extract_nickname", None)
+    if callable(extractor):
+        try:
+            nickname = str(extractor(raw, hostuin=hostuin) or "").strip()
+        except Exception:
+            nickname = ""
+        if _clean_nickname_fallback(nickname, hostuin=hostuin):
+            return nickname
+    if isinstance(raw, dict):
+        stack: list[Any] = [raw]
+        for _ in range(48):
+            if not stack:
+                break
+            item = stack.pop(0)
+            if isinstance(item, dict):
+                owner = int(item.get("uin") or item.get("hostuin") or item.get("user_id") or 0)
+                if not hostuin or not owner or owner == hostuin:
+                    for key in ("nickname", "nickName", "name", "ownerName"):
+                        nickname = _clean_nickname_fallback(item.get(key), hostuin=hostuin)
+                        if nickname:
+                            return nickname
+                stack.extend(value for value in item.values() if isinstance(value, (dict, list)))
+            elif isinstance(item, list):
+                stack.extend(value for value in item if isinstance(value, (dict, list)))
+    return ""
+
+
+def _selection_has_explicit_input(selection: Any) -> bool:
+    helper = getattr(_bridge_compat, "selection_has_explicit_input", None)
+    if callable(helper):
+        return bool(helper(selection))
+    for attribute in (
+        "has_explicit_input",
+        "explicit_target",
+        "explicit_selector",
+        "explicit_comment_text",
+        "fid",
+        "comment_text",
+        "target_uin",
+    ):
+        try:
+            if bool(getattr(selection, attribute, False)):
+                return True
+        except Exception:
+            pass
+    try:
+        selector = str(getattr(selection, "selector", "") or "").strip().lower()
+        explicit_range = (
+            int(getattr(selection, "start", 1) or 1) != 1
+            or int(getattr(selection, "end", 1) or 1) != 1
+        )
+        return bool(selector and selector != "latest") or explicit_range
+    except Exception:
+        return False
+
+
+def _minimal_combine_rendered_post_cards(paths: list[Path], output_dir: Path) -> Path | None:
+    if len(paths) <= 1:
+        return paths[0] if paths else None
+    try:
+        import uuid
+        from PIL import Image, UnidentifiedImageError
+    except Exception:
+        return None
+    images: list[Any] = []
+    try:
+        for path in paths:
+            try:
+                with Image.open(path) as opened:
+                    images.append(opened.convert("RGB").copy())
+            except (OSError, UnidentifiedImageError):
+                return None
+        width = max((image.width for image in images), default=0)
+        if not width:
+            return None
+        gap = max(12, min(32, width // 40))
+        height = sum(image.height for image in images) + gap * (len(images) - 1)
+        canvas = Image.new("RGB", (width, height), (255, 255, 255))
+        y = 0
+        for image in images:
+            canvas.paste(image, (0, y))
+            y += image.height + gap
+        output_dir.mkdir(parents=True, exist_ok=True)
+        prune = getattr(_publish_renderer, "_prune_output_dir", None)
+        if callable(prune):
+            prune(output_dir)
+        output_path = output_dir / f"publish_result_{int(time.time())}_{uuid.uuid4().hex[:10]}_cards.png"
+        canvas.save(output_path, "PNG", optimize=False, compress_level=1)
+        canvas.close()
+        return output_path
+    finally:
+        for image in images:
+            try:
+                image.close()
+            except Exception:
+                pass
+
+
+def _combine_rendered_post_cards(paths: list[Path], output_dir: Path) -> Path | None:
+    helper = getattr(_bridge_compat, "combine_rendered_post_cards_compat", None)
+    if callable(helper):
+        return helper(paths, output_dir, renderer_module=_publish_renderer)
+    combiner = getattr(_publish_renderer, "combine_rendered_post_cards", None)
+    if callable(combiner):
+        return combiner(paths, output_dir)
+    logger.warning("qzone post card combiner missing; using minimal import-compatible fallback")
+    return _minimal_combine_rendered_post_cards(paths, output_dir)
+
+
+def _render_publish_result_image(*args: Any, fixed_width: bool = False, **kwargs: Any) -> Path:
+    if not fixed_width:
+        return render_publish_result_image(*args, **kwargs)
+    try:
+        return render_publish_result_image(*args, fixed_width=fixed_width, **kwargs)
+    except TypeError as exc:
+        if "fixed_width" not in str(exc):
+            raise
+        return render_publish_result_image(*args, **kwargs)
+
+
+def _identity_filter_decorator(*args: Any, **kwargs: Any):
+    def decorator(func):
+        return func
+
+    return decorator
+
+
+if not hasattr(filter, "command"):
+    setattr(filter, "command", _identity_filter_decorator)
+if not hasattr(filter, "permission_type"):
+    setattr(filter, "permission_type", _identity_filter_decorator)
+if not hasattr(filter, "PermissionType"):
+    setattr(filter, "PermissionType", type("PermissionType", (), {"ADMIN": "admin"}))
+
+
+class QzoneStablePlugin(Star):
+    def __init__(self, context: Context, config: Any | None = None):
+        super().__init__(context)
+        self._context = context
+        raw_config = config if config is not None else getattr(context, "get_config", lambda: {})()
+        self.settings = PluginSettings.from_mapping(raw_config)
+        logger.info(
+            "qzone settings loaded publish_cron=%s life_publish_enabled=%s life_mode=%s life_failure_policy=%s",
+            self.settings.publish_cron,
+            getattr(self.settings, "life_publish_enabled", False),
+            getattr(self.settings, "life_publish_mode", "publish"),
+            getattr(self.settings, "life_publish_failure_policy", "skip"),
+        )
+        self.root = Path(__file__).resolve().parent
+        self.plugin_name = _read_plugin_name(self.root)
+        self.data_dir = _standard_data_dir(self.root)
+        self._onebot_client: Any | None = None
+        self._cookie_lock: asyncio.Lock | None = None
+        self._video_upload_lock: asyncio.Lock | None = None
+        self._last_video_upload_probe: dict[str, Any] = {}
+        self.controller = QzoneDaemonController(
+            plugin_root=self.root,
+            data_dir=self.data_dir,
+            default_port=self.settings.daemon_port,
+            request_timeout=self.settings.request_timeout,
+            start_timeout=self.settings.start_timeout,
+            keepalive_interval=self.settings.keepalive_interval,
+            user_agent=self.settings.user_agent,
+            auto_start_daemon=self.settings.auto_start_daemon,
+        )
+        self._capture_onebot_client_from_context()
+        self._daemon_warmup_task: asyncio.Task | None = None
+        self._auto_bind_bootstrap_task: asyncio.Task | None = None
+        self._page_preload_task: asyncio.Task | None = None
+        self._page_feed_preload_task: asyncio.Task | None = None
+        self._last_page_feed_preload_at = 0.0
+        self._auto_bind_bootstrap_succeeded = False
+        self._scheduled_tasks: list[asyncio.Task] = []
+        self._publisher_profile_cache: tuple[int, RenderProfile] | None = None
+        self._publisher_profile_preload_task: asyncio.Task | None = None
+        self.drafts = DraftStore(self.data_dir / "drafts.json")
+        self.posts = PostStore(self.data_dir / "posts.json")
+        self.llm = QzoneLLM(self._context, self.settings)
+        self.page_api = QzonePageApi(
+            controller=self.controller,
+            post_service_factory=self._post_service,
+            settings=self.settings,
+            status_provider=self._status_with_recovery,
+            preload_scheduler=self._schedule_page_preload,
+        )
+        self._pillowmd_style: Any | None = None
+        self._pillowmd_style_dir = ""
+        preload_static_render_assets()
+        self._register_page_web_apis()
+
+    def _sender_id(self, event: AstrMessageEvent) -> int:
+        try:
+            if hasattr(event, "get_sender_id"):
+                value = event.get_sender_id()
+                if value is not None:
+                    return int(value)
+        except Exception:
+            pass
+        message_obj = getattr(event, "message_obj", None)
+        sender = getattr(message_obj, "sender", None)
+        return int(getattr(sender, "user_id", 0) or 0)
+
+    def _is_admin(self, event: AstrMessageEvent) -> bool:
+        try:
+            if hasattr(event, "is_admin") and event.is_admin():
+                return True
+        except Exception:
+            pass
+        return self._sender_id(event) in set(self.settings.admin_uins)
+
+    def _command_result(self, event: AstrMessageEvent, text: str):
+        self._stop_event(event)
+        return event.plain_result(text)
+
+    @staticmethod
+    def _star_instance_from_metadata(metadata: Any) -> Any | None:
+        if metadata is None:
+            return None
+        for attr in ("star_cls", "star", "instance", "plugin", "plugin_instance"):
+            instance = getattr(metadata, attr, None)
+            if instance is not None:
+                return instance
+        return metadata
+
+    def _registered_star_plugin(self, *names: str) -> Any | None:
+        context = getattr(self, "_context", None) or getattr(self, "context", None)
+        getter = getattr(context, "get_registered_star", None)
+        if not callable(getter):
+            return None
+        for name in names:
+            try:
+                metadata = getter(name)
+            except Exception as exc:
+                logger.debug("qzone registered star lookup failed name=%s: %s", name, exc)
+                continue
+            plugin = self._star_instance_from_metadata(metadata)
+            if plugin is not None:
+                return plugin
+        return None
+
+    def _life_scheduler_plugin(self) -> Any | None:
+        return self._registered_star_plugin(
+            "astrbot_plugin_life_scheduler",
+            "life_scheduler",
+            "LifeSchedulerPlugin",
+        )
+
+    def _omnidraw_plugin(self) -> Any | None:
+        return self._registered_star_plugin(
+            "astrbot_plugin_omnidraw",
+            "omnidraw",
+            "OmniDrawPlugin",
+        )
+
+    def _post_store(self) -> PostStore:
+        expected = self.data_dir / "posts.json"
+        if getattr(self.posts, "path", None) != expected:
+            self.posts = PostStore(expected)
+        return self.posts
+
+    def _post_service(self) -> QzonePostService:
+        return QzonePostService(
+            self.controller,
+            self._post_store(),
+            max_feed_limit=self.settings.max_feed_limit,
+        )
+
+    def _register_page_web_apis(self) -> None:
+        context = getattr(self, "_context", None) or getattr(self, "context", None)
+        register = getattr(context, "register_web_api", None)
+        if not callable(register):
+            return
+        routes = (
+            ("page/status", self.page_status, ["GET"], "Qzone Page status"),
+            ("page/feed", self.page_feed, ["GET"], "Qzone Page feed"),
+            ("page/detail", self.page_detail, ["GET"], "Qzone Page detail"),
+            ("page/publish", self.page_publish, ["POST"], "Qzone Page publish"),
+            ("page/like", self.page_like, ["POST"], "Qzone Page like"),
+            ("page/comment", self.page_comment, ["POST"], "Qzone Page comment"),
+            ("page/reply", self.page_reply, ["POST"], "Qzone Page reply"),
+            ("page/delete", self.page_delete, ["POST"], "Qzone Page delete"),
+            ("page/upload-media", self.page_upload_media, ["POST"], "Qzone Page upload media"),
+            ("page/media", self.page_media, ["GET"], "Qzone Page media stream"),
+        )
+        for endpoint, handler, methods, description in routes:
+            path = f"/{self.plugin_name}/{endpoint}"
+            try:
+                register(path, handler, methods, description)
+            except TypeError:
+                register(path, handler, methods)
+
+    async def _page_response(self, payload: dict[str, Any], *, status: int = 200):
+        if _quart_jsonify is None:
+            return payload
+        response = _quart_jsonify(payload)
+        response.status_code = status
+        return response
+
+    async def _page_json(self, callback):
+        try:
+            payload = await callback()
+            status = 200
+        except Exception as exc:
+            payload, status = page_error_payload(exc)
+            try:
+                request_path = str(getattr(_quart_request, "path", "") or "")
+            except Exception:
+                request_path = ""
+            callback_name = getattr(callback, "__qualname__", getattr(callback, "__name__", type(callback).__name__))
+            logger.warning(
+                "qzone page api failed route=%s callback=%s: %s",
+                request_path,
+                callback_name,
+                exc,
+                exc_info=True,
+            )
+        return await self._page_response(payload, status=status)
+
+    async def _page_query_params(self) -> dict[str, Any]:
+        request = _quart_request
+        if request is None:
+            return {}
+        args = getattr(request, "args", {}) or {}
+        try:
+            items = args.items(multi=False)
+        except TypeError:
+            items = args.items() if hasattr(args, "items") else []
+        try:
+            return {str(key): value for key, value in items}
+        except TypeError:
+            return dict(args)
+
+    async def _page_json_body(self) -> dict[str, Any]:
+        request = _quart_request
+        if request is None:
+            return {}
+        getter = getattr(request, "get_json", None)
+        data: Any = None
+        if callable(getter):
+            try:
+                data = await self._maybe_await(getter(silent=True))
+            except TypeError:
+                data = await self._maybe_await(getter())
+        if data is None:
+            data = await self._maybe_await(getattr(request, "json", None))
+        return data if isinstance(data, dict) else {}
+
+    async def page_status(self):
+        return await self._page_json(self.page_api.status)
+
+    async def page_feed(self):
+        params = await self._page_query_params()
+        return await self._page_json(lambda: self.page_api.feed(params))
+
+    async def page_detail(self):
+        params = await self._page_query_params()
+        return await self._page_json(lambda: self.page_api.detail(params))
+
+    async def page_publish(self):
+        body = await self._page_json_body()
+        return await self._page_json(lambda: self.page_api.publish(body))
+
+    async def page_like(self):
+        body = await self._page_json_body()
+        return await self._page_json(lambda: self.page_api.like(body))
+
+    async def page_comment(self):
+        body = await self._page_json_body()
+        return await self._page_json(lambda: self.page_api.comment(body))
+
+    async def page_reply(self):
+        body = await self._page_json_body()
+        return await self._page_json(lambda: self.page_api.reply(body))
+
+    async def page_delete(self):
+        body = await self._page_json_body()
+        return await self._page_json(lambda: self.page_api.delete(body))
+
+    async def page_upload_media(self):
+        async def handle_upload():
+            request = _quart_request
+            if request is None:
+                raise QzoneBridgeError("当前运行环境不支持 Page 文件上传")
+            files = await self._maybe_await(getattr(request, "files", None))
+            upload = None
+            if hasattr(files, "get"):
+                upload = files.get("file") or files.get("image") or files.get("media")
+            if upload is None:
+                body = await self._page_json_body()
+                return await self.page_api.upload_media_payload(body)
+            data = await self._maybe_await(upload.read())
+            return await self.page_api.upload_media(
+                filename=getattr(upload, "filename", "") or "image.jpg",
+                content_type=getattr(upload, "content_type", "") or "",
+                data=data or b"",
+            )
+
+        return await self._page_json(handle_upload)
+
+    async def page_media(self):
+        try:
+            params = await self._page_query_params()
+            media = self.page_api.page_media_ref(params.get("id") or params.get("media_id"))
+            request = _quart_request
+            headers = getattr(request, "headers", {}) if request is not None else {}
+            range_header = str(headers.get("Range") or headers.get("range") or "")
+            download = str(params.get("download") or "").strip().lower() in {"1", "true", "yes"}
+            body, status, response_headers = await open_page_media_stream(
+                media,
+                range_header=range_header,
+                download=download,
+            )
+            if _quart_response_class is None:
+                return body, status, response_headers
+            return _quart_response_class(body, status=status, headers=response_headers)
+        except Exception as exc:
+            payload, status = page_error_payload(exc)
+            return json.dumps(payload, ensure_ascii=False), status, {
+                "Content-Type": "application/json; charset=utf-8",
+                "Cache-Control": "no-store",
+            }
+
+    def _llm_adapter(self) -> QzoneLLM:
+        self.llm.context = getattr(self, "_context", None) or getattr(self, "context", None)
+        self.llm.settings = self.settings
+        return self.llm
+
+    @staticmethod
+    def _onebot_file_uri(path: Path) -> str:
+        try:
+            return path.resolve().as_uri()
+        except ValueError:
+            return "file:///" + path.resolve().as_posix().lstrip("/")
+
+    async def _render_markdown_image(self, text: str, subdir: str = "markdown") -> Path | None:
+        style_dir = str(self.settings.pillowmd_style_dir or "").strip()
+        if not style_dir:
+            return None
+        try:
+            import pillowmd  # type: ignore
+
+            if self._pillowmd_style is None or self._pillowmd_style_dir != style_dir:
+                self._pillowmd_style = pillowmd.LoadMarkdownStyles(style_dir)
+                self._pillowmd_style_dir = style_dir
+            output_dir = self.data_dir / "pillowmd" / subdir
+            output_dir.mkdir(parents=True, exist_ok=True)
+            rendered = await self._pillowmd_style.AioRender(text=text, useImageUrl=True)
+            return Path(rendered.Save(output_dir))
+        except Exception as exc:
+            logger.debug("qzone pillowmd render failed: %s", exc)
+            return None
+
+    async def _markdown_result(self, event: AstrMessageEvent, text: str, subdir: str = "markdown"):
+        image_path = await self._render_markdown_image(text, subdir=subdir)
+        image_result = getattr(event, "image_result", None)
+        if image_path is not None and callable(image_result):
+            self._stop_event(event)
+            return image_result(str(image_path))
+        return self._command_result(event, text)
+
+    def _render_asset_dir(self) -> Path:
+        return self.data_dir / "render_assets"
+
+    @staticmethod
+    def _clone_render_profile(profile: RenderProfile, *, time_text: str = "") -> RenderProfile:
+        return RenderProfile(
+            nickname=profile.nickname,
+            user_id=profile.user_id,
+            avatar_source=profile.avatar_source,
+            time_text=time_text or profile.time_text,
+        )
+
+    @staticmethod
+    def _qlogo_url(uin: int, size: int) -> str:
+        return f"https://q1.qlogo.cn/g?b=qq&nk={uin}&s={size}"
+
+    def _publisher_avatar_sources(
+        self,
+        login_uin: int,
+        *,
+        primary: str = "",
+        onebot_avatar: str = "",
+    ) -> tuple[str, ...]:
+        candidates = [
+            primary,
+            onebot_avatar,
+            self._qlogo_url(login_uin, 640),
+            self._qlogo_url(login_uin, 140),
+            self._qlogo_url(login_uin, 100),
+        ]
+        result: list[str] = []
+        for source in candidates:
+            source = str(source or "").strip()
+            if source and source not in result:
+                result.append(source)
+        return tuple(result)
+
+    def _cached_publisher_profile(self, login_uin: int, *, time_text: str) -> RenderProfile | None:
+        cached = self._publisher_profile_cache
+        if cached is None:
+            return None
+        cached_uin, cached_profile = cached
+        if cached_uin != login_uin:
+            return None
+        return self._clone_render_profile(cached_profile, time_text=time_text)
+
+    async def _publisher_render_profile(
+        self,
+        event: AstrMessageEvent | None = None,
+        *,
+        status: dict[str, Any] | None = None,
+        allow_network: bool = False,
+        cache_assets: bool = True,
+    ) -> RenderProfile:
+        profile = profile_from_event(event) if event is not None else RenderProfile(time_text=time.strftime("%H:%M"))
+        if status is None:
+            try:
+                status = await self.controller.get_status(probe_daemon=False)
+            except QzoneBridgeError:
+                status = {}
+
+        login_uin = int((status or {}).get("login_uin") or 0)
+        if not login_uin:
+            return profile
+
+        cached = self._cached_publisher_profile(login_uin, time_text=profile.time_text)
+        if cached is not None and (
+            not allow_network
+            or _clean_nickname_fallback(getattr(cached, "nickname", ""), hostuin=login_uin)
+        ):
+            return cached
+
+        nickname = str(
+            (status or {}).get("login_nickname")
+            or (status or {}).get("nickname")
+            or (status or {}).get("publisher_nickname")
+            or ""
+        ).strip()
+        avatar_source = str((status or {}).get("login_avatar") or (status or {}).get("avatar") or "").strip()
+        onebot_avatar = ""
+        if allow_network:
+            bot = self._capture_onebot_client(event)
+            if bot is not None:
+                try:
+                    fetched = await asyncio.wait_for(self._fetch_onebot_user_info(bot, login_uin), timeout=1.2)
+                except Exception:
+                    fetched = {}
+                if fetched:
+                    nickname = nickname or str(fetched.get("nickname") or fetched.get("name") or "").strip()
+                    onebot_avatar = str(fetched.get("avatar") or fetched.get("avatar_url") or "").strip()
+                    avatar_source = onebot_avatar or avatar_source
+
+        fallback_name = "" if profile.nickname == "QQ Space" else profile.nickname
+        base_profile = RenderProfile(
+            nickname=nickname or fallback_name or str(login_uin),
+            user_id=str(login_uin),
+            avatar_source=avatar_source or self._qlogo_url(login_uin, 640),
+            time_text=profile.time_text,
+        )
+        if not cache_assets:
+            cached_profile = RenderProfile(
+                nickname=base_profile.nickname,
+                user_id=base_profile.user_id,
+                avatar_source=base_profile.avatar_source,
+                time_text="",
+            )
+            self._publisher_profile_cache = (login_uin, cached_profile)
+            return self._clone_render_profile(cached_profile, time_text=profile.time_text)
+
+        cached_avatar = cached_avatar_source(self._render_asset_dir(), base_profile)
+        if cached_avatar:
+            cached_profile = RenderProfile(
+                nickname=base_profile.nickname,
+                user_id=base_profile.user_id,
+                avatar_source=cached_avatar,
+                time_text="",
+            )
+            self._publisher_profile_cache = (login_uin, cached_profile)
+            return self._clone_render_profile(cached_profile, time_text=profile.time_text)
+
+        if not allow_network:
+            base_profile.avatar_source = ""
+            return base_profile
+
+        sources = self._publisher_avatar_sources(login_uin, primary=base_profile.avatar_source, onebot_avatar=onebot_avatar)
+        preloaded = await asyncio.to_thread(
+            preload_publish_render_assets,
+            base_profile,
+            self._render_asset_dir(),
+            avatar_sources=sources,
+            remote_timeout=max(float(self.settings.render_remote_timeout or 0), 2.5),
+        )
+        cached_profile = RenderProfile(
+            nickname=preloaded.nickname or str(login_uin),
+            user_id=preloaded.user_id or str(login_uin),
+            avatar_source=preloaded.avatar_source,
+            time_text="",
+        )
+        self._publisher_profile_cache = (login_uin, cached_profile)
+        return self._clone_render_profile(cached_profile, time_text=profile.time_text)
+
+    async def _fetch_onebot_user_info(self, bot: Any, uin: int) -> dict[str, Any]:
+        for method_name, kwargs in (
+            ("get_stranger_info", {"user_id": uin, "no_cache": False}),
+            ("get_friend_info", {"user_id": uin}),
+            ("get_user_info", {"user_id": uin}),
+        ):
+            method = getattr(bot, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                result = method(**kwargs)
+                if asyncio.iscoroutine(result):
+                    result = await result
+            except TypeError:
+                try:
+                    result = method(uin)
+                    if asyncio.iscoroutine(result):
+                        result = await result
+                except Exception:
+                    continue
+            except Exception:
+                continue
+            if isinstance(result, dict):
+                return result
+        return {}
+
+    def _cached_profile_has_display_name(self, login_uin: int) -> bool:
+        cached = self._cached_publisher_profile(login_uin, time_text="")
+        if cached is None:
+            return False
+        return bool(_clean_nickname_fallback(getattr(cached, "nickname", ""), hostuin=login_uin))
+
+    def _schedule_login_profile_preload(
+        self,
+        trigger: str,
+        *,
+        event: AstrMessageEvent | None = None,
+        status: dict[str, Any] | None = None,
+    ) -> None:
+        login_uin = int((status or {}).get("login_uin") or (status or {}).get("uin") or 0)
+        if login_uin and self._cached_profile_has_display_name(login_uin):
+            return
+        task = getattr(self, "_publisher_profile_preload_task", None)
+        if task is not None and not task.done():
+            return
+
+        async def runner() -> None:
+            try:
+                await self._publisher_render_profile(
+                    event,
+                    status=status,
+                    allow_network=True,
+                    cache_assets=False,
+                )
+            except Exception:
+                logger.debug("qzone login profile preload on %s failed", trigger, exc_info=True)
+
+        self._publisher_profile_preload_task = asyncio.create_task(runner())
+
+    def _schedule_publish_render_asset_preload(
+        self,
+        trigger: str,
+        *,
+        event: AstrMessageEvent | None = None,
+        status: dict[str, Any] | None = None,
+    ) -> None:
+        if not self.settings.render_publish_result:
+            self._schedule_login_profile_preload(trigger, event=event, status=status)
+            return
+        login_uin = int((status or {}).get("login_uin") or 0)
+        if login_uin and self._cached_profile_has_display_name(login_uin):
+            return
+        task = self._publisher_profile_preload_task
+        if task is not None and not task.done():
+            return
+
+        async def runner() -> None:
+            try:
+                await self._publisher_render_profile(event, status=status, allow_network=True)
+            except Exception:
+                logger.debug("qzone publish render asset preload on %s failed", trigger, exc_info=True)
+
+        self._publisher_profile_preload_task = asyncio.create_task(runner())
+
+    def _schedule_publisher_profile(self, event: AstrMessageEvent) -> asyncio.Task | None:
+        if not self.settings.render_publish_result:
+            return None
+        return asyncio.create_task(self._publisher_render_profile(event, allow_network=False))
+
+    async def _publish_result(
+        self,
+        event: AstrMessageEvent,
+        post: PostPayload,
+        payload: dict[str, Any],
+        *,
+        profile_task: asyncio.Task | None = None,
+    ):
+        text = format_action_result("发布结果", payload)
+        if not self.settings.render_publish_result:
+            self._stop_event(event)
+            return event.plain_result(text)
+        try:
+            profile = await profile_task if profile_task is not None else await self._publisher_render_profile(event)
+        except Exception:
+            profile = profile_from_event(event)
+        try:
+            image_path = await asyncio.to_thread(
+                _render_publish_result_image,
+                post,
+                self.data_dir / "rendered_posts",
+                profile=profile,
+                result=payload,
+                width=self.settings.render_result_width,
+                remote_timeout=self.settings.render_remote_timeout,
+            )
+        except Exception as exc:
+            logger.exception("qzone publish result render failed: %s", exc)
+            self._stop_event(event)
+            return event.plain_result(text)
+
+        image_result = getattr(event, "image_result", None)
+        if callable(image_result):
+            self._stop_event(event)
+            return image_result(str(image_path))
+        self._stop_event(event)
+        return event.plain_result(f"{text}\n图片路径: {image_path}")
+
+    async def _manual_publish_completion_results(
+        self,
+        event: AstrMessageEvent,
+        post: PostPayload,
+        payload: dict[str, Any],
+        message: str,
+    ) -> list[Any]:
+        settings = getattr(self, "settings", SimpleNamespace())
+        if not getattr(settings, "render_publish_result", True):
+            return [self._command_result(event, message)]
+        try:
+            profile = await self._publisher_render_profile(event, allow_network=False)
+        except Exception:
+            profile = profile_from_event(event)
+        render_post = getattr(payload, "post", None) or post
+        try:
+            image_path = await asyncio.to_thread(
+                _render_publish_result_image,
+                render_post,
+                self.data_dir / "rendered_posts",
+                profile=profile,
+                result=payload,
+                width=int(getattr(settings, "render_result_width", 900) or 900),
+                remote_timeout=float(getattr(settings, "render_remote_timeout", 0.35) or 0.35),
+            )
+        except Exception as exc:
+            logger.exception("qzone manual publish result render failed: %s", exc)
+            return [self._command_result(event, message)]
+        outgoing = [
+            {"type": "text", "data": {"text": f"{message}\n"}},
+            {"type": "image", "data": {"file": self._onebot_file_uri(image_path)}},
+        ]
+        try:
+            bot = self._capture_onebot_sender(event)
+        except Exception as exc:
+            logger.debug("qzone manual publish direct feedback sender lookup failed: %s", exc)
+            bot = None
+        if bot is not None:
+            sent = await self._send_event_outgoing(bot, event, outgoing)
+            if sent:
+                self._stop_event(event)
+                return []
+
+        make_result = getattr(event, "make_result", None)
+        if callable(make_result):
+            try:
+                result = make_result().message(message).file_image(str(image_path))
+                self._stop_event(event)
+                return [result]
+            except Exception as exc:
+                logger.debug("qzone manual publish chain image feedback failed: %s", exc)
+
+        image_result = getattr(event, "image_result", None)
+        if callable(image_result):
+            self._stop_event(event)
+            return [self._command_result(event, message), image_result(str(image_path))]
+        self._stop_event(event)
+        return [event.plain_result(f"{message}\n图片路径: {image_path}")]
+
+    def _post_render_limit(self) -> int:
+        limit = int(getattr(self.settings, "render_feed_card_limit", 5) or 5)
+        return max(1, min(limit, self.settings.max_feed_limit))
+
+    @staticmethod
+    def _post_display_nickname(post: QzonePost) -> str:
+        hostuin = int(post.hostuin or 0)
+        nickname = _extract_nickname_compat({"nickname": post.nickname}, hostuin=hostuin)
+        if not nickname:
+            nickname = _extract_nickname_compat(post.raw, hostuin=hostuin)
+        return nickname or "QQ 空间用户"
+
+    @staticmethod
+    def _post_time_text(post: QzonePost) -> str:
+        created_at = int(post.created_at or 0)
+        if created_at <= 0:
+            return UNKNOWN_POST_TIME_TEXT
+        try:
+            created = datetime.fromtimestamp(created_at)
+        except (OSError, OverflowError, ValueError):
+            return UNKNOWN_POST_TIME_TEXT
+        if created.date() == datetime.now().date():
+            return created.strftime("%H:%M")
+        return created.strftime("%m-%d %H:%M")
+
+    def _post_render_profile(self, post: QzonePost) -> RenderProfile:
+        user_id = str(post.hostuin or "")
+        return RenderProfile(
+            nickname=self._post_display_nickname(post),
+            user_id=user_id,
+            avatar_source=self._qlogo_url(post.hostuin, 640) if post.hostuin else "",
+            time_text=self._post_time_text(post),
+        )
+
+    @staticmethod
+    def _post_render_payload(post: QzonePost) -> PostPayload:
+        media = [
+            PostMedia(kind="image", source=str(source), name=source_name(str(source)))
+            for source in post.images[:9]
+            if str(source or "").strip()
+        ]
+        return PostPayload(content=(post.summary or "(空)").strip(), media=media)
+
+    async def _render_qzone_post_card(
+        self,
+        post: QzonePost,
+        *,
+        fixed_width: bool = False,
+        comment_text: str = "",
+    ) -> Path | None:
+        if not self.settings.render_publish_result:
+            return None
+        result: dict[str, Any] = {"ok": True, "tool": "qzone_post_card", "fid": post.fid}
+        if str(comment_text or "").strip():
+            result["comment"] = truncate(str(comment_text).strip(), 220)
+        try:
+            return await asyncio.to_thread(
+                _render_publish_result_image,
+                self._post_render_payload(post),
+                self.data_dir / "rendered_posts",
+                profile=self._post_render_profile(post),
+                result=result,
+                width=self.settings.render_result_width,
+                remote_timeout=self.settings.render_remote_timeout,
+                fixed_width=fixed_width,
+            )
+        except Exception as exc:
+            logger.exception("qzone post card render failed: %s", exc)
+            return None
+
+    async def _render_qzone_post_cards(
+        self,
+        posts: list[QzonePost],
+        *,
+        comment_texts: dict[int, str] | None = None,
+    ) -> list[Path]:
+        if not posts:
+            return []
+        if len(posts) == 1:
+            path = await self._render_qzone_post_card(posts[0], comment_text=(comment_texts or {}).get(id(posts[0]), ""))
+            return [path] if path is not None else []
+
+        semaphore = asyncio.Semaphore(min(3, len(posts)))
+
+        async def render_one(post: QzonePost) -> Path | None:
+            async with semaphore:
+                return await self._render_qzone_post_card(
+                    post,
+                    fixed_width=True,
+                    comment_text=(comment_texts or {}).get(id(post), ""),
+                )
+
+        rendered = await asyncio.gather(*(render_one(post) for post in posts))
+        return [path for path in rendered if path is not None]
+
+    async def _post_card_results(
+        self,
+        event: AstrMessageEvent,
+        posts: list[QzonePost],
+        fallback_text: str,
+        *,
+        subdir: str = "posts",
+        fallback_when_unrendered: bool = True,
+        comment_texts: dict[int, str] | None = None,
+    ) -> list[Any]:
+        if not posts:
+            return [self._command_result(event, fallback_text)] if fallback_when_unrendered else []
+        image_result = getattr(event, "image_result", None)
+        if not self.settings.render_publish_result or not callable(image_result):
+            if fallback_when_unrendered:
+                return [await self._markdown_result(event, fallback_text, subdir=subdir)]
+            return []
+
+        results: list[Any] = []
+        limit = self._post_render_limit()
+        image_paths = await self._render_qzone_post_cards(posts[:limit], comment_texts=comment_texts)
+        if len(image_paths) > 1:
+            try:
+                combined_path = await asyncio.to_thread(
+                    _combine_rendered_post_cards,
+                    image_paths,
+                    self.data_dir / "rendered_posts",
+                )
+            except Exception as exc:
+                logger.exception("qzone post card merge failed: %s", exc)
+                combined_path = None
+            if combined_path is not None:
+                image_paths = [combined_path]
+            elif fallback_when_unrendered:
+                return [await self._markdown_result(event, fallback_text, subdir=subdir)]
+            else:
+                return [self._command_result(event, "说说卡片图片合成失败，请缩小范围后重试。")]
+        for image_path in image_paths:
+            self._stop_event(event)
+            results.append(image_result(str(image_path)))
+
+        if not results and fallback_when_unrendered:
+            return [await self._markdown_result(event, fallback_text, subdir=subdir)]
+        if len(posts) > limit:
+            results.append(self._command_result(event, f"已渲染前 {limit} 条说说，其余内容请缩小范围后查看。"))
+        return results
+
+    async def _yield_post_card_results(
+        self,
+        event: AstrMessageEvent,
+        posts: list[QzonePost],
+        fallback_text: str,
+        *,
+        subdir: str = "posts",
+        fallback_when_unrendered: bool = True,
+        comment_texts: dict[int, str] | None = None,
+    ):
+        for result in await self._post_card_results(
+            event,
+            posts,
+            fallback_text,
+            subdir=subdir,
+            fallback_when_unrendered=fallback_when_unrendered,
+            comment_texts=comment_texts,
+        ):
+            yield result
+
+    async def _post_from_detail_target(self, hostuin: int, fid: str, appid: int = 311) -> QzonePost | None:
+        try:
+            detail_payload = await self.controller.detail_feed(hostuin=hostuin, fid=fid, appid=appid)
+            entry_data = detail_payload.get("entry")
+            entry = (
+                FeedEntry(**entry_data)
+                if isinstance(entry_data, dict)
+                else FeedEntry(hostuin=hostuin, fid=fid, appid=appid, summary="")
+            )
+            post = post_from_entry(entry, detail=detail_payload.get("raw"), local_id=1)
+            if detail_payload.get("comments"):
+                post.comments = [
+                    QzoneComment(
+                        commentid=str(item.get("commentid") or ""),
+                        uin=int(item.get("uin") or 0),
+                        nickname=str(item.get("nickname") or ""),
+                        content=str(item.get("content") or ""),
+                        created_at=int(item.get("created_at") or item.get("date") or 0),
+                        parent_id=str(item.get("parent_id") or ""),
+                    )
+                    for item in detail_payload.get("comments") or []
+                    if isinstance(item, dict)
+                ]
+                post.comment_count = max(post.comment_count, len(post.comments))
+            return post
+        except Exception as exc:
+            logger.debug("qzone detail fetch for post card failed: %s", exc)
+            return None
+
+    async def _notify_admin_post_card(
+        self,
+        event: AstrMessageEvent | None,
+        post: QzonePost,
+        message: str,
+        *,
+        comment_text: str = "",
+    ) -> None:
+        if not self.settings.send_admin:
+            logger.debug("qzone admin post card notification skipped: send_admin disabled")
+            return
+        bot = self._capture_onebot_sender(event)
+        if bot is None:
+            logger.warning("qzone admin post card notification skipped: no OneBot client")
+            return
+        try:
+            image_path = await self._render_qzone_post_card(post, comment_text=comment_text)
+        except TypeError as exc:
+            if "comment_text" not in str(exc):
+                raise
+            image_path = await self._render_qzone_post_card(post)
+        outgoing: Any = message
+        if image_path is not None:
+            logger.info("qzone admin post card rendered path=%s", image_path)
+            outgoing = [
+                {"type": "text", "data": {"text": f"{message}\n"}},
+                {"type": "image", "data": {"file": self._onebot_file_uri(image_path)}},
+            ]
+        else:
+            logger.warning("qzone admin post card render returned no image; sending text fallback")
+        await self._send_admin_outgoing(bot, outgoing)
+
+    async def _notify_event_post_card(
+        self,
+        event: AstrMessageEvent,
+        post: QzonePost,
+        message: str,
+        *,
+        comment_text: str = "",
+    ) -> None:
+        bot = self._capture_onebot_sender(event)
+        if bot is None:
+            logger.warning("qzone event post card notification skipped: no OneBot client")
+            return
+        try:
+            image_path = await self._render_qzone_post_card(post, comment_text=comment_text)
+        except TypeError as exc:
+            if "comment_text" not in str(exc):
+                raise
+            image_path = await self._render_qzone_post_card(post)
+        outgoing: Any = message
+        if image_path is not None:
+            logger.info("qzone event post card rendered path=%s", image_path)
+            outgoing = [
+                {"type": "text", "data": {"text": f"{message}\n"}},
+                {"type": "image", "data": {"file": self._onebot_file_uri(image_path)}},
+            ]
+        else:
+            logger.warning("qzone event post card render returned no image; sending text fallback")
+        await self._send_event_outgoing(bot, event, outgoing)
+
+    async def _notify_admin_publish_result(
+        self,
+        post: PostPayload,
+        payload: dict[str, Any],
+        message: str,
+    ) -> None:
+        if not getattr(self.settings, "send_admin", False):
+            logger.debug("qzone scheduled publish admin notification skipped: send_admin disabled")
+            return
+        bot = self._capture_onebot_sender(None)
+        if bot is None:
+            logger.warning("qzone scheduled publish admin notification skipped: no OneBot client")
+            return
+        result_text = format_action_result("发布结果", payload)
+        outgoing: Any = f"{message}\n{result_text}"
+        if getattr(self.settings, "render_publish_result", True):
+            try:
+                profile = await self._publisher_render_profile(None, allow_network=False)
+            except Exception:
+                profile = RenderProfile(time_text=time.strftime("%H:%M"))
+            try:
+                image_path = await asyncio.to_thread(
+                    _render_publish_result_image,
+                    post,
+                    self.data_dir / "rendered_posts",
+                    profile=profile,
+                    result=payload,
+                    width=int(getattr(self.settings, "render_result_width", 900) or 900),
+                    remote_timeout=float(getattr(self.settings, "render_remote_timeout", 0.35) or 0.35),
+                )
+            except Exception as exc:
+                logger.exception("qzone scheduled publish result render failed: %s", exc)
+            else:
+                logger.info("qzone scheduled publish result rendered path=%s", image_path)
+                outgoing = [
+                    {"type": "text", "data": {"text": f"{message}\n"}},
+                    {"type": "image", "data": {"file": self._onebot_file_uri(image_path)}},
+                ]
+        await self._send_admin_outgoing(bot, outgoing)
+
+    @staticmethod
+    def _coerce_uin_targets(values: Any) -> list[int]:
+        if values is None:
+            return []
+        if isinstance(values, str):
+            items: Any = values.split(",")
+        elif isinstance(values, (list, tuple, set)):
+            items = values
+        else:
+            items = [values]
+        targets: list[int] = []
+        seen: set[int] = set()
+        for item in items:
+            text = str(item or "").strip()
+            if not text.isdigit():
+                continue
+            target = int(text)
+            if target > 0 and target not in seen:
+                targets.append(target)
+                seen.add(target)
+        return targets
+
+    def _global_admin_targets(self) -> list[int]:
+        context = getattr(self, "_context", None) or getattr(self, "context", None)
+        if context is None:
+            return []
+        try:
+            config = context.get_config()
+        except Exception as exc:
+            logger.debug("qzone global admin target lookup failed: %s", exc)
+            return []
+        getter = getattr(config, "get", None)
+        if callable(getter):
+            return self._coerce_uin_targets(getter("admins_id", []))
+        return self._coerce_uin_targets(getattr(config, "admins_id", []))
+
+    def _admin_private_targets(self) -> tuple[list[int], str]:
+        configured = self._coerce_uin_targets(getattr(self.settings, "admin_uins", []))
+        if configured:
+            return configured, "admin_uins"
+        global_admins = self._global_admin_targets()
+        if global_admins:
+            return global_admins, "admins_id"
+        return [], ""
+
+    async def _call_onebot_action(self, bot: Any, action: str, **kwargs: Any) -> None:
+        method = getattr(bot, action, None)
+        if callable(method):
+            await self._maybe_await(self._invoke_onebot_call_action(method, "", kwargs))
+            return
+        last_type_error: TypeError | None = None
+        for call_action in self._iter_onebot_action_callers(bot):
+            try:
+                await self._maybe_await(self._invoke_onebot_call_action(call_action, action, kwargs))
+                return
+            except TypeError as exc:
+                last_type_error = exc
+                continue
+        if last_type_error is not None:
+            raise last_type_error
+        raise AttributeError(f"OneBot client does not support {action}")
+
+    @staticmethod
+    def _iter_onebot_action_callers(bot: Any) -> list[Any]:
+        return list(iter_onebot_action_callers(bot))
+
+    async def _invoke_onebot_call_action(self, call_action: Any, action: str, kwargs: dict[str, Any]) -> Any:
+        attempts: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+        if action:
+            envelope_kwargs = dict(kwargs)
+            attempts.extend(
+                [
+                    ((action,), dict(kwargs)),
+                    ((), {"action": action, **kwargs}),
+                    ((action, kwargs), {}),
+                    ((action,), {"params": kwargs}),
+                    ((), {"action": action, "params": kwargs}),
+                    (({"action": action, "params": envelope_kwargs},), {}),
+                    (({"action": action, "data": envelope_kwargs},), {}),
+                    (({"action": action, "payload": envelope_kwargs},), {}),
+                    (({"api": action, "params": envelope_kwargs},), {}),
+                    (({"api": action, "data": envelope_kwargs},), {}),
+                    ((action,), {"data": kwargs}),
+                    ((), {"action": action, "data": kwargs}),
+                    ((action,), {"payload": kwargs}),
+                    ((), {"action": action, "payload": kwargs}),
+                ]
+            )
+        else:
+            attempts.extend(
+                [
+                    ((), dict(kwargs)),
+                    ((kwargs,), {}),
+                    ((), {"params": kwargs}),
+                    ((), {"data": kwargs}),
+                    ((), {"payload": kwargs}),
+                ]
+            )
+        last_error: TypeError | None = None
+        for args, params in attempts:
+            try:
+                return await self._maybe_await(call_action(*args, **params))
+            except TypeError as exc:
+                last_error = exc
+                continue
+        if last_error is not None:
+            raise last_error
+        return await self._maybe_await(call_action(action, **kwargs) if action else call_action(**kwargs))
+
+    async def _query_onebot_action(self, bot: Any, action: str, **kwargs: Any) -> Any:
+        method = getattr(bot, action, None)
+        if callable(method):
+            return await self._maybe_await(self._invoke_onebot_call_action(method, "", kwargs))
+        last_type_error: TypeError | None = None
+        for call_action in self._iter_onebot_action_callers(bot):
+            try:
+                return await self._invoke_onebot_call_action(call_action, action, kwargs)
+            except TypeError as exc:
+                last_type_error = exc
+                continue
+        if last_type_error is not None:
+            raise last_type_error
+        raise AttributeError(f"OneBot client does not support {action}")
+
+    @staticmethod
+    def _onebot_identifier_param_variants(identifier: Any) -> list[dict[str, Any]]:
+        text = str(identifier or "").strip()
+        if not text:
+            return []
+        values: list[Any] = [identifier]
+        if text != identifier:
+            values.append(text)
+        if text.isdigit():
+            number = int(text)
+            values.append(number)
+        variants: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for key in ("message_id", "id"):
+            for value in values:
+                if value in (None, ""):
+                    continue
+                marker = (key, f"{type(value).__name__}:{value}")
+                if marker in seen:
+                    continue
+                seen.add(marker)
+                variants.append({key: value})
+        return variants
+
+    async def _query_onebot_message(self, bot: Any, message_id: Any) -> Any:
+        last_error: Exception | None = None
+        for params in self._onebot_identifier_param_variants(message_id):
+            try:
+                return await self._query_onebot_action(bot, "get_msg", **params)
+            except Exception as exc:
+                last_error = exc
+                logger.debug("qzone OneBot get_msg failed params=%s: %s", params, exc)
+        if last_error is not None:
+            raise last_error
+        raise ValueError("empty message id")
+
+    async def _send_admin_outgoing(self, bot: Any, outgoing: Any) -> int:
+        sent = 0
+        manage_group = int(getattr(self.settings, "manage_group", 0) or 0)
+        admin_targets, admin_source = self._admin_private_targets()
+        if manage_group:
+            try:
+                await self._call_onebot_action(bot, "send_group_msg", group_id=manage_group, message=outgoing)
+            except Exception as exc:
+                logger.warning("qzone admin notification group send failed group_id=%s: %s", manage_group, exc)
+            else:
+                logger.info("qzone admin notification sent to manage_group=%s", manage_group)
+                return 1
+
+        for admin in admin_targets:
+            try:
+                await self._call_onebot_action(bot, "send_private_msg", user_id=admin, message=outgoing)
+            except Exception as exc:
+                logger.warning("qzone admin notification private send failed user_id=%s: %s", admin, exc)
+                continue
+            sent += 1
+            logger.info("qzone admin notification sent to %s user_id=%s", admin_source, admin)
+
+        if sent:
+            return sent
+        if manage_group or admin_targets:
+            logger.warning("qzone admin notification skipped: no supported OneBot send method or all sends failed")
+        else:
+            logger.warning(
+                "qzone admin notification skipped: no target; configure manage_group/admin_uins or AstrBot admins_id"
+            )
+        return 0
+
+    async def _send_event_outgoing(self, bot: Any, event: AstrMessageEvent, outgoing: Any) -> int:
+        group_id = self._group_id(event)
+        if group_id:
+            try:
+                await self._call_onebot_action(bot, "send_group_msg", group_id=group_id, message=outgoing)
+            except Exception as exc:
+                logger.warning("qzone event notification group send failed group_id=%s: %s", group_id, exc)
+                return 0
+            logger.info("qzone event notification sent to group_id=%s", group_id)
+            return 1
+
+        user_id = self._sender_id(event)
+        if user_id:
+            try:
+                await self._call_onebot_action(bot, "send_private_msg", user_id=user_id, message=outgoing)
+            except Exception as exc:
+                logger.warning("qzone event notification private send failed user_id=%s: %s", user_id, exc)
+                return 0
+            logger.info("qzone event notification sent to user_id=%s", user_id)
+            return 1
+
+        logger.warning("qzone event notification skipped: no current group or sender target")
+        return 0
+
+    def _stop_event(self, event: AstrMessageEvent) -> None:
+        stopper = getattr(event, "stop_event", None)
+        if callable(stopper):
+            try:
+                stopper()
+            except Exception:
+                pass
+
+    def _error_text(self, exc: QzoneBridgeError) -> str:
+        if not exc.detail:
+            return exc.message
+        parts = _public_error_detail_parts(exc.detail)
+        if parts:
+            return f"{exc.message}（{', '.join(dict.fromkeys(parts))}）"
+        return exc.message
+
+    def _log_tool_call_result(self, payload: dict[str, Any]) -> None:
+        safe_payload = _safe_for_tool_log(payload)
+        try:
+            data = json.dumps(
+                _redact_for_log(safe_payload),
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )
+        except Exception:
+            data = str(_redact_for_log(safe_payload))
+        if payload.get("ok"):
+            logger.info("qzone llm tool result: %s", data)
+        else:
+            logger.warning("qzone llm tool result: %s", data)
+
+    @staticmethod
+    def _bridge_error_log_payload(tool: str, exc: QzoneBridgeError, arguments: dict[str, Any]) -> dict[str, Any]:
+        error: dict[str, Any] = {
+            "type": type(exc).__name__,
+            "code": exc.code,
+            "message": exc.message,
+        }
+        status_code = getattr(exc, "status_code", None)
+        if status_code is not None:
+            error["status_code"] = status_code
+        return {
+            "ok": False,
+            "tool": tool,
+            "arguments": arguments,
+            "error": error,
+            "detail": exc.detail,
+        }
+
+    @staticmethod
+    def _status_error_payload(exc: QzoneBridgeError) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "type": type(exc).__name__,
+            "code": exc.code,
+            "message": exc.message,
+        }
+        detail = _safe_for_llm(exc.detail)
+        if detail not in (None, {}, []):
+            payload["detail"] = detail
+        return payload
+
+    def _status_with_cached_profile(self, status: dict[str, Any]) -> dict[str, Any]:
+        enriched = dict(status or {})
+        login_uin = int(enriched.get("login_uin") or enriched.get("uin") or 0)
+        if not login_uin:
+            return enriched
+        cached = self._cached_publisher_profile(login_uin, time_text="")
+        if cached is None:
+            return enriched
+        nickname = _clean_nickname_fallback(getattr(cached, "nickname", ""), hostuin=login_uin)
+        if nickname and not _clean_nickname_fallback(enriched.get("login_nickname") or enriched.get("nickname"), hostuin=login_uin):
+            enriched["login_nickname"] = nickname
+        avatar = str(getattr(cached, "avatar_source", "") or "").strip()
+        if avatar and not str(enriched.get("login_avatar") or enriched.get("avatar") or "").strip():
+            enriched["login_avatar"] = avatar
+        return enriched
+
+    async def _status_with_live_profile(self, status: dict[str, Any]) -> dict[str, Any]:
+        enriched = self._status_with_cached_profile(status)
+        login_uin = int(enriched.get("login_uin") or enriched.get("uin") or 0)
+        if not login_uin:
+            return enriched
+        if _clean_nickname_fallback(enriched.get("login_nickname") or enriched.get("nickname"), hostuin=login_uin):
+            return enriched
+        if self._capture_onebot_client(None) is None:
+            self._schedule_login_profile_preload("status missing profile", status=enriched)
+            return enriched
+        try:
+            await asyncio.wait_for(
+                self._publisher_render_profile(
+                    None,
+                    status=enriched,
+                    allow_network=True,
+                    cache_assets=False,
+                ),
+                timeout=0.9,
+            )
+        except Exception:
+            self._schedule_login_profile_preload("status live fallback", status=enriched)
+            return enriched
+        return self._status_with_cached_profile(enriched)
+
+    async def _status_with_recovery(self) -> dict[str, Any]:
+        status = await self.controller.get_status()
+        should_start = (
+            self.settings.auto_start_daemon
+            and status.get("daemon_state") != "ready"
+            and int(status.get("cookie_count") or 0) > 0
+            and not bool(status.get("needs_rebind"))
+        )
+        if not should_start:
+            status = await self._status_with_live_profile(status)
+            self._schedule_publish_render_asset_preload("status", status=status)
+            return status
+        try:
+            recovered = await self.controller.ensure_running()
+            recovered = await self._status_with_live_profile(recovered)
+            self._schedule_publish_render_asset_preload("status recovery", status=recovered)
+            return recovered
+        except QzoneBridgeError as exc:
+            try:
+                detail_text = json.dumps(_redact_for_log(exc.detail), ensure_ascii=False, default=str)
+            except Exception:
+                detail_text = str(_redact_for_log(exc.detail))
+            logger.warning("qzone daemon status recovery failed: %s detail=%s", exc.message, detail_text)
+            fallback = await self.controller.get_status(probe_daemon=False)
+            fallback["daemon_start_error"] = self._status_error_payload(exc)
+            fallback = await self._status_with_live_profile(fallback)
+            self._schedule_publish_render_asset_preload("status fallback", status=fallback)
+            return fallback
+
+
+    async def _maybe_await(self, value: Any) -> Any:
+        if inspect.isawaitable(value):
+            return await value
+        return value
+
+    @staticmethod
+    def _text_from_llm_response(response: Any) -> str:
+        if response is None:
+            return ""
+        if isinstance(response, str):
+            return response.strip()
+        for attr in ("completion_text", "text", "content", "message"):
+            value = getattr(response, attr, None)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        if isinstance(response, dict):
+            for key in ("completion_text", "text", "content", "message"):
+                value = response.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        return ""
+
+    @staticmethod
+    def _llm_reply_looks_structured(text: str) -> bool:
+        stripped = str(text or "").strip()
+        if not stripped:
+            return False
+        lowered = stripped.lower()
+        if stripped.startswith(("{", "[", "```")) or "```json" in lowered:
+            return True
+        if re.match(r"^\s*(?:result|结果)\s*[:：]", stripped, flags=re.IGNORECASE):
+            return True
+        structured_markers = (
+            '"ok"',
+            '"tool"',
+            '"raw"',
+            '"detail"',
+            '"diagnostic"',
+            '"status_code"',
+            "'ok'",
+            "'tool'",
+            "'raw'",
+            "'detail'",
+            "'diagnostic'",
+            "'status_code'",
+        )
+        return sum(1 for marker in structured_markers if marker in lowered) >= 2
+
+    @staticmethod
+    def _llm_reply_mentions_forbidden_terms(text: str) -> bool:
+        lowered = text.lower()
+        return any(term.lower() in lowered for term in LLM_REPLY_FORBIDDEN_TERMS)
+
+    @staticmethod
+    def _llm_reply_contradicts_payload(text: str, payload: dict[str, Any]) -> bool:
+        if not payload.get("ok") or payload.get("tool") != "qzone_like_post":
+            return False
+        result = payload.get("result")
+        if not isinstance(result, dict) or result.get("verified") is not False:
+            return False
+        lowered = str(text or "").lower()
+        bad_markers = (
+            "ok:false",
+            "ok: false",
+            '"ok":false',
+            '"ok": false',
+            "'ok':false",
+            "'ok': false",
+            "status_code",
+            "403",
+            "failed",
+            "failure",
+            "unsuccessful",
+            "not successful",
+            "intercepted",
+            "\u5931\u8d25",
+            "\u672a\u6210\u529f",
+            "\u4e0d\u6210\u529f",
+            "\u62e6\u622a",
+            "\u672a\u751f\u6548",
+        )
+        return any(marker in lowered for marker in bad_markers)
+
+    @classmethod
+    def _llm_tool_reply_is_safe(cls, text: str, payload: dict[str, Any]) -> bool:
+        if not text.strip():
+            return False
+        if cls._llm_reply_looks_structured(text):
+            return False
+        if cls._llm_reply_mentions_forbidden_terms(text):
+            return False
+        return not cls._llm_reply_contradicts_payload(text, payload)
+
+    @staticmethod
+    def _llm_tool_reply_summary(payload: dict[str, Any]) -> str:
+        if payload.get("ok"):
+            result = payload.get("result")
+            if payload.get("tool") == "qzone_like_post" and isinstance(result, dict):
+                unlike = result.get("action") == "unlike"
+                action = "取消点赞" if unlike else "点赞"
+                summary = truncate(str(result.get("summary") or "").strip(), 60)
+                target = f"「{summary}」" if summary else "这条说说"
+                if result.get("already"):
+                    return f"{target}之前已经是{action}状态。"
+                if result.get("verified") is False:
+                    pending = "取消了" if unlike else "点上了"
+                    return f"{target}这次已经{pending}，QQ 空间显示可能会慢一点。"
+                done = "取消掉了" if unlike else "点好了"
+                return f"{target}这次已经{done}。"
+            if payload.get("tool") == "qzone_delete_post" and isinstance(result, dict):
+                count = int(result.get("count") or 0)
+                summary = truncate(str(result.get("summary") or "").strip(), 60)
+                if count > 1:
+                    return f"{count} 条说说已经删好了。"
+                target = f"「{summary}」" if summary else "这条说说"
+                return f"{target}已经删好了。"
+            visible = _safe_for_llm(result)
+            if isinstance(visible, dict):
+                message = visible.get("message") or visible.get("summary") or visible.get("text")
+                if message:
+                    return str(message)
+            return "这件事已经好了。"
+
+        reason = (
+            payload.get("public_reason")
+            or payload.get("public_message")
+            or payload.get("message")
+            or ""
+        )
+        error = payload.get("error")
+        if not reason and isinstance(error, dict):
+            reason = error.get("message") or ""
+        reason_text = _public_error_reason(reason)
+        return f"现在还没办法继续。可参考的简短原因：{reason_text}"
+
+    @staticmethod
+    def _llm_error_fallback_text(message: Any) -> str:
+        reason = _public_error_reason(message)
+        lowered = reason.lower()
+        if "参考图" in reason or "人设" in reason:
+            return "这会儿还没法弄，等参考内容准备好再来吧。"
+        if "cookie" in lowered or "登录" in reason or "登入" in reason:
+            return "这会儿还没法动空间，登录状态得先补一下。"
+        if "权限" in reason or "管理员" in reason:
+            return "这个我现在不能直接动，得让管理员来。"
+        return "这会儿还没法弄，晚点再试一下吧。"
+
+    async def _current_provider_id(self, event: AstrMessageEvent) -> Any | None:
+        context = getattr(self, "_context", None) or getattr(self, "context", None)
+        getter = getattr(context, "get_current_chat_provider_id", None)
+        if not callable(getter):
+            return None
+        umo = getattr(event, "unified_msg_origin", None)
+        attempts: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+        if umo is not None:
+            attempts.append(((), {"umo": umo}))
+            attempts.append(((umo,), {}))
+        attempts.append(((), {}))
+        for args, kwargs in attempts:
+            try:
+                provider_id = await self._maybe_await(getter(*args, **kwargs))
+            except TypeError:
+                continue
+            except Exception as exc:
+                logger.debug("qzone llm provider id lookup failed: %s", exc)
+                return None
+            if provider_id:
+                return provider_id
+        return None
+
+    async def _ask_llm_tool_reply(self, event: AstrMessageEvent, payload: dict[str, Any], fallback: str) -> str:
+        summary = self._llm_tool_reply_summary(payload)
+        prompt = (
+            "下面这句只是给你理解刚才发生了什么，不要照抄，也不要复述成固定格式：\n"
+            f"{summary}\n"
+            "请沿用当前聊天里的人设和说话习惯，给用户回一句自然中文，像真人顺口聊天。\n"
+            "要求：\n"
+            "- 一句话为主，最多两句；可以很短。\n"
+            "- 不要输出 JSON、Markdown 代码块、字段解释、前缀或标签。\n"
+            "- 不要提工具、系统、后台、API、参数、指令、命令、错误代码、状态码或内部流程。\n"
+            "- 不要说“生成”“绘制”“绘图”“渲染”“处理完成”“任务完成”“已发送”。\n"
+            "- 失败或暂时不可用时，只生活化地说现在还不行或晚点再来，不要展开技术原因。\n"
+            "- 成功时随口收尾一句就好；如果只是显示同步慢，不要说成失败。\n"
+        )
+        system_prompt = (
+            "沿用当前聊天角色和语气。你只负责把结果变成自然口语回复，不能暴露任何内部实现信息。"
+        )
+        try:
+            text = await self._llm_adapter().generate_text(
+                event,
+                prompt,
+                system_prompt=system_prompt,
+                prefer_current_provider=True,
+            )
+        except Exception as exc:
+            logger.debug("qzone llm tool reply failed: %s", exc)
+        else:
+            if self._llm_tool_reply_is_safe(text, payload):
+                return text
+            if text:
+                logger.warning("discarded unsafe qzone llm tool reply: %s", truncate(text, 300))
+
+        return fallback
+
+    def _llm_like_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        visible_payload = _safe_for_llm(payload)
+        if visible_payload.get("verified") is False:
+            visible_payload.pop("verification", None)
+            visible_payload["accepted"] = True
+            visible_payload["operation_status"] = "accepted_pending_verification"
+            visible_payload["verification_meaning"] = "QQ readback is stale; do not treat this as failure."
+        elif visible_payload.get("verified") is True:
+            visible_payload["accepted"] = True
+            visible_payload["operation_status"] = (
+                "already_in_target_state" if visible_payload.get("already") else "verified_success"
+            )
+        return {
+            "ok": True,
+            "tool": "qzone_like_post",
+            "result": visible_payload,
+            "reply_guidance": [
+                "Reply in Chinese natural language only.",
+                "Do not output JSON or expose internal fields.",
+                "If verified is false but ok is true, say the request was accepted and QQ readback may sync shortly; do not call it a failure.",
+                "Only describe failure when ok is false.",
+            ],
+        }
+
+    @staticmethod
+    def _like_fallback_text(payload: dict[str, Any]) -> str:
+        unlike = payload.get("action") == "unlike"
+        action = "\u53d6\u6d88\u70b9\u8d5e" if unlike else "\u70b9\u8d5e"
+        summary = truncate(str(payload.get("summary") or "").strip(), 60)
+        target = f"\u300c{summary}\u300d" if summary else "\u8fd9\u6761\u8bf4\u8bf4"
+        if payload.get("verified"):
+            if payload.get("already"):
+                return f"{target}\u4e4b\u524d\u5c31\u5df2\u7ecf{action}\u4e86\u3002"
+            done = "\u53d6\u6d88\u6389" if unlike else "\u70b9\u597d"
+            return f"{target}\u6211\u5e2e\u4f60{done}\u4e86\u3002"
+        pending = "\u53d6\u6d88\u4e86" if unlike else "\u70b9\u4e0a\u4e86"
+        return f"{target}\u6211\u5148\u5e2e\u4f60{pending}\uff0cQQ \u7a7a\u95f4\u90a3\u8fb9\u53ef\u80fd\u8981\u7b49\u4e00\u4f1a\u513f\u624d\u663e\u793a\u3002"
+
+    def _llm_error_payload(self, tool: str, exc: QzoneBridgeError) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "public_reason": _public_error_reason(exc.message),
+            "reply_guidance": "Use a short natural reply in the active persona. Do not expose error details.",
+        }
+
+    async def _ensure_daemon(self, *, allow_needs_rebind: bool = False) -> None:
+        status = await self.controller.get_status()
+        if status.get("needs_rebind") and not allow_needs_rebind:
+            raise QzoneNeedsRebind("QQ 空间登录态已失效，需要重新绑定 Cookie")
+        if allow_needs_rebind:
+            if status.get("daemon_state") != "ready":
+                await self.controller.ensure_running()
+            return
+        if self.settings.auto_start_daemon:
+            if status.get("daemon_state") != "ready":
+                await self.controller.ensure_running()
+        elif status.get("daemon_state") != "ready":
+            raise DaemonUnavailableError("daemon 未运行")
+
+    def _limit(self, limit: int | None) -> int:
+        if not limit or limit <= 0:
+            return self.settings.public_feed_limit
+        return min(limit, self.settings.max_feed_limit)
+
+    def _to_feed_entries(self, payload: dict[str, Any]) -> list[FeedEntry]:
+        items = payload.get("items") or []
+        entries: list[FeedEntry] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            entries.append(FeedEntry(**item))
+        return entries
+
+    def _render_detail(self, payload: dict[str, Any]) -> str:
+        entry = FeedEntry(**payload["entry"])
+        text = format_feed_detail(entry)
+        comments = payload.get("comments") or []
+        if comments:
+            lines = [text, "", "评论"]
+            for comment in comments[:5]:
+                nickname = comment.get("nickname") or comment.get("uin") or "-"
+                lines.append(f"- {nickname}: {truncate(str(comment.get('content') or ''), 80)}")
+            return "\n".join(lines)
+        return text
+
+    @staticmethod
+    def _event_text(event: AstrMessageEvent) -> str:
+        value = getattr(event, "message_str", None)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        message_obj = getattr(event, "message_obj", None)
+        parts: list[str] = []
+        for item in getattr(message_obj, "message", []) or []:
+            if isinstance(item, str):
+                parts.append(item)
+                continue
+            text = getattr(item, "text", None)
+            if isinstance(text, str):
+                parts.append(text)
+                continue
+            data = getattr(item, "data", None)
+            if isinstance(data, dict) and isinstance(data.get("text"), str):
+                parts.append(data["text"])
+        return "".join(parts).strip()
+
+    @staticmethod
+    def _message_after_command(text: str, names: tuple[str, ...]) -> str:
+        text = str(text or "").strip()
+        text = re.sub(r"^(?:[!/／]\s*)", "", text).strip()
+        for name in sorted(names, key=len, reverse=True):
+            if text == name:
+                return ""
+            if text.startswith(name):
+                rest = text[len(name):]
+                if not rest or rest[0].isspace() or rest[0] in {":", "："}:
+                    return rest.lstrip(" \t:：")
+        return text
+
+    def _sender_name(self, event: AstrMessageEvent) -> str:
+        for getter in ("get_sender_name", "get_sender_nickname"):
+            method = getattr(event, getter, None)
+            if callable(method):
+                try:
+                    value = method()
+                except Exception:
+                    value = None
+                if value:
+                    return str(value)
+        message_obj = getattr(event, "message_obj", None)
+        sender = getattr(message_obj, "sender", None)
+        for attr in ("nickname", "card", "name"):
+            value = getattr(sender, attr, None)
+            if value:
+                return str(value)
+        return str(self._sender_id(event) or "")
+
+    def _group_id(self, event: AstrMessageEvent) -> int:
+        getter = getattr(event, "get_group_id", None)
+        if callable(getter):
+            try:
+                value = getter()
+                if value:
+                    return int(value)
+            except Exception:
+                pass
+        message_obj = getattr(event, "message_obj", None)
+        try:
+            return int(getattr(message_obj, "group_id", 0) or 0)
+        except Exception:
+            return 0
+
+    def _self_id(self, event: AstrMessageEvent) -> int:
+        getter = getattr(event, "get_self_id", None)
+        if callable(getter):
+            try:
+                value = getter()
+                if value:
+                    return int(value)
+            except Exception:
+                pass
+        try:
+            status = getattr(self.controller, "store", None).read()  # type: ignore[union-attr]
+            return int(status.session.uin or 0)
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _at_uins(event: AstrMessageEvent, text: str = "") -> list[int]:
+        uins: list[int] = []
+        message_obj = getattr(event, "message_obj", None)
+        for item in getattr(message_obj, "message", []) or []:
+            data = getattr(item, "data", None)
+            if isinstance(data, dict):
+                value = data.get("qq") or data.get("uin") or data.get("user_id")
+                if value and str(value).isdigit():
+                    uins.append(int(value))
+            for attr in ("qq", "uin", "user_id"):
+                value = getattr(item, attr, None)
+                if value and str(value).isdigit():
+                    uins.append(int(value))
+        for match in re.finditer(r"\[CQ:at,qq=(\d+)[^\]]*\]|@(\d{5,})", text):
+            value = match.group(1) or match.group(2)
+            if value:
+                uins.append(int(value))
+        deduped: list[int] = []
+        for uin in uins:
+            if uin not in deduped:
+                deduped.append(uin)
+        return deduped
+
+    def _parse_target_range(self, event: AstrMessageEvent, names: tuple[str, ...]) -> tuple[int, int, int]:
+        selection = self._selection_for_event(event, names)
+        return selection.target_uin, selection.start, selection.end
+
+    def _selection_for_event(self, event: AstrMessageEvent, names: tuple[str, ...]) -> PostSelection:
+        text = self._event_text(event)
+        selection = parse_post_selection(text, names)
+        if not selection.target_uin:
+            at_uins = self._at_uins(event, text)
+            if at_uins:
+                selection.target_uin = at_uins[0]
+        return selection
+
+    def _tool_target_uin(self, event: AstrMessageEvent, *values: Any, fallback: int = 0) -> int:
+        for value in values:
+            try:
+                target = int(value or 0)
+            except (TypeError, ValueError):
+                target = 0
+            if target > 0:
+                return target
+        at_uins = self._at_uins(event, self._event_text(event))
+        if at_uins:
+            return at_uins[0]
+        return int(fallback or 0)
+
+    def _selection_from_tool_args(
+        self,
+        event: AstrMessageEvent,
+        *,
+        target_uin: int = 0,
+        selector: str = "latest",
+        hostuin: int = 0,
+        fid: str = "",
+        appid: int = 311,
+        latest: bool = False,
+        index: int = 0,
+        use_event_target: bool = True,
+    ) -> PostSelection:
+        selection = selection_from_tool_args(
+            target_uin=target_uin,
+            selector=selector,
+            hostuin=hostuin,
+            fid=fid,
+            appid=appid,
+            latest=latest,
+            index=index,
+        )
+        if use_event_target and not selection.target_uin:
+            selection.target_uin = self._tool_target_uin(event)
+        return selection
+
+    async def _posts_for_selection(
+        self,
+        selection: PostSelection,
+        *,
+        target_id: int | None = None,
+        with_detail: bool = False,
+        no_commented: bool = False,
+        no_self: bool = False,
+        login_uin: int | None = None,
+    ) -> list[QzonePost]:
+        if target_id is not None:
+            selection.target_uin = int(target_id)
+        return await self._post_service().resolve_posts(
+            selection,
+            with_detail=with_detail,
+            no_commented=no_commented,
+            no_self=no_self,
+            login_uin=self._self_id_placeholder(login_uin),
+        )
+
+    @staticmethod
+    def _self_id_placeholder(login_uin: int | None) -> int:
+        return int(login_uin or 0)
+
+    async def _posts_for_event(
+        self,
+        event: AstrMessageEvent,
+        names: tuple[str, ...],
+        *,
+        target_id: int | None = None,
+        with_detail: bool = False,
+        no_commented: bool = False,
+        no_self: bool = False,
+    ) -> list[QzonePost]:
+        return await self._posts_for_selection(
+            self._selection_for_event(event, names),
+            target_id=target_id,
+            with_detail=with_detail,
+            no_commented=no_commented,
+            no_self=no_self,
+            login_uin=self._self_id(event),
+        )
+
+    @staticmethod
+    def _format_posts(posts: list[QzonePost], *, detail: bool = False) -> str:
+        if not posts:
+            return "没有找到可见说说。"
+        if detail:
+            return "\n\n".join(post.detail_text(post.local_id) for post in posts)
+        return "\n\n".join(post.brief(post.local_id) for post in posts)
+
+    def _event_text_has_comment_intent(self, event: AstrMessageEvent) -> bool:
+        text = self._event_text(event)
+        if not text:
+            return False
+        if re.search(r"(不要|别|先别|不用|无需).{0,4}(评论|评|回复)", text):
+            return False
+        if re.search(r"(评论区|评论列表|看.{0,6}评论|看看.{0,6}评论|查看.{0,6}评论|读.{0,6}评论)", text):
+            return False
+        return bool(
+            re.search(
+                r"(评说说|评论说说|帮.{0,8}评论|给.{0,8}评论|评论一下|评一下|评一评|"
+                r"留个言|留句话|回一句|回评|回复评论)",
+                text,
+            )
+        )
+
+    def _event_text_has_like_intent(self, event: AstrMessageEvent) -> bool:
+        text = self._event_text(event)
+        if not text:
+            return False
+        if re.search(r"(不要|别|先别|不用|无需).{0,4}(赞|点赞)", text):
+            return False
+        if re.search(r"(点赞数|赞数|谁点赞|谁赞|看.{0,6}赞|看看.{0,6}赞|查看.{0,6}赞)", text):
+            return False
+        return bool(re.search(r"(赞说说|帮.{0,8}点赞|给.{0,8}点赞|点个赞|点赞一下|赞一下)", text))
+
+    async def _comment_posts_for_tool(
+        self,
+        event: AstrMessageEvent,
+        posts: list[QzonePost],
+        *,
+        content: str = "",
+        auto_generate: bool = True,
+        private: bool = False,
+        like_after_comment: bool = False,
+    ) -> list[dict[str, Any]]:
+        if not posts:
+            raise QzoneBridgeError("没有找到可评论的说说")
+        results: list[dict[str, Any]] = []
+        for post in posts:
+            comment_text = content.strip()
+            if not comment_text and auto_generate:
+                comment_text = await self._generate_comment_text(event, post)
+            if not comment_text:
+                raise QzoneBridgeError("评论内容为空")
+            payload = await self._post_service().comment_post(post, comment_text, private=private)
+            item: dict[str, Any] = {
+                "post": QzonePostService.post_payload(post),
+                "comment": comment_text,
+                "result": payload,
+            }
+            if like_after_comment:
+                item["like_result"] = await self._post_service().like_post(post)
+            results.append(item)
+        return results
+
+    async def _ask_llm_view_reply(
+        self,
+        event: AstrMessageEvent,
+        posts: list[QzonePost],
+        *,
+        detail: bool,
+        fallback: str,
+    ) -> str:
+        if not posts:
+            return fallback
+        lines = ["下面是刚才查到的 QQ 空间说说内容，只能用这些可见信息回复用户："]
+        for post in posts[:5]:
+            index = post.local_id or 1
+            lines.append(f"第 {index} 条：{truncate(post.summary or '(空)', 220)}")
+            if detail and post.images:
+                lines.append(f"图片：{len(post.images[:9])} 张")
+            if detail and post.comments:
+                lines.append("评论：")
+                for comment in post.comments[:5]:
+                    name = comment.nickname or str(comment.uin or "用户")
+                    if comment.content:
+                        lines.append(f"- {name}: {truncate(comment.content, 80)}")
+        prompt = (
+            "\n".join(lines)
+            + "\n\n请沿用当前 AstrBot 人格和当前聊天语气，把这些内容自然告诉用户。"
+            "保留“第 N 条”这种可见编号，方便用户继续说“评论第 N 条”或“赞第 N 条”。"
+            "不要输出 JSON、Markdown 代码块、工具名、字段名、fid、hostuin、参数或内部流程。"
+        )
+        payload = {"ok": True, "tool": "qzone_view_post", "result": {"message": fallback}}
+        try:
+            text = await self._llm_adapter().generate_text(
+                event,
+                prompt,
+                system_prompt="沿用当前聊天角色和语气。你只负责把查看到的说说变成自然中文回复。",
+                prefer_current_provider=True,
+            )
+        except Exception as exc:
+            logger.debug("qzone llm view reply failed: %s", exc)
+        else:
+            if self._llm_tool_reply_is_safe(text, payload):
+                return text
+            if text:
+                logger.warning("discarded unsafe qzone llm view reply: %s", truncate(text, 300))
+        return fallback
+
+    @staticmethod
+    def _format_visitors(payload: dict[str, Any]) -> str:
+        items = payload.get("items") or []
+        if not items:
+            return "暂时没有访客记录。"
+        lines = ["最近访客"]
+        for index, item in enumerate(items[:20], 1):
+            if not isinstance(item, dict):
+                continue
+            name = item.get("nickname") or item.get("uin") or "-"
+            uin = item.get("uin") or ""
+            lines.append(f"{index}. {name} {uin}".strip())
+        return "\n".join(lines)
+
+    def _draft_id_from_event(self, event: AstrMessageEvent, names: tuple[str, ...]) -> tuple[int, str]:
+        raw = self._message_after_command(self._event_text(event), names)
+        parts = raw.split(maxsplit=1)
+        if not parts:
+            return 0, ""
+        try:
+            return int(parts[0]), parts[1] if len(parts) > 1 else ""
+        except ValueError:
+            return 0, raw
+
+    @staticmethod
+    def _onebot_data_payload(payload: Any) -> Any:
+        if isinstance(payload, dict) and payload.get("data") not in (None, ""):
+            return payload["data"]
+        return payload
+
+    @staticmethod
+    def _onebot_segment_kind(segment: Any) -> str:
+        if isinstance(segment, dict):
+            raw = segment.get("type") or segment.get("kind") or ""
+        else:
+            raw = getattr(segment, "type", None) or getattr(segment, "kind", None) or segment.__class__.__name__
+        kind = str(raw or "").split(".")[-1].lower()
+        aliases = {
+            "plain": "text",
+            "picture": "image",
+            "voice": "record",
+            "audio": "record",
+        }
+        return aliases.get(kind, kind)
+
+    @staticmethod
+    def _onebot_segment_data(segment: Any) -> dict[str, Any]:
+        if isinstance(segment, dict):
+            merged = dict(segment)
+            data = segment.get("data")
+            if isinstance(data, dict):
+                merged.update(data)
+            return merged
+        data: dict[str, Any] = {}
+        raw_dict = getattr(segment, "__dict__", None)
+        if isinstance(raw_dict, dict):
+            data.update(raw_dict)
+        component_data = getattr(segment, "data", None)
+        if isinstance(component_data, dict):
+            data.update(component_data)
+        for attr in (
+            "text",
+            "content",
+            "message",
+            "file_",
+            "url",
+            "download_url",
+            "downloadUrl",
+            "file_url",
+            "fileUrl",
+            "media_url",
+            "mediaUrl",
+            "origin_url",
+            "originUrl",
+            "original_url",
+            "originalUrl",
+            "cdn_url",
+            "cdnUrl",
+            "preview_url",
+            "previewUrl",
+            "path",
+            "file_path",
+            "filePath",
+            "absolute_path",
+            "absolutePath",
+            "abs_path",
+            "absPath",
+            "local_path",
+            "localPath",
+            "source",
+            "src",
+            "name",
+            "filename",
+            "file_name",
+            "fileName",
+            "mime",
+            "mime_type",
+            "size",
+            "file_size",
+            "fileSize",
+            "file_id",
+            "fileId",
+            "file_unique",
+            "fileUnique",
+            "id",
+            "message_id",
+            "messageId",
+            "seq",
+            "chain",
+        ):
+            if attr not in data and hasattr(segment, attr):
+                with contextlib.suppress(Exception):
+                    data[attr] = getattr(segment, attr)
+        if "file" not in data and segment.__class__.__name__.lower() != "file" and hasattr(segment, "file"):
+            with contextlib.suppress(Exception):
+                data["file"] = getattr(segment, "file")
+        return data
+
+    @staticmethod
+    def _source_placeholder(value: Any) -> bool:
+        return str(value or "").strip().lower() in {"", "empty", "null", "none", "nil", "undefined", "false"}
+
+    @staticmethod
+    def _usable_media_source(value: Any) -> str:
+        if QzoneStablePlugin._source_placeholder(value):
+            return ""
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+        if raw.startswith(("http://", "https://", "base64://", "data:", "file://")):
+            return normalize_source(raw) or raw
+        source = normalize_source(raw)
+        if not source:
+            return ""
+        if re.match(r"^[A-Za-z]:", source) or source.startswith(("/", "\\")):
+            return source
+        if "\\" in source or "/" in source:
+            return source
+        try:
+            if Path(source).is_file():
+                return source
+        except OSError:
+            return ""
+        return ""
+
+    @classmethod
+    def _onebot_local_source_exists(cls, source: str, data: dict[str, Any], kind: str) -> bool:
+        if source.startswith(("http://", "https://", "base64://", "data:")):
+            return True
+        name = cls._onebot_media_name(data, source)
+        is_video = cls._onebot_segment_is_video(kind, {**data, "source": source})
+        suffixes = QZONE_VIDEO_SUFFIXES if is_video else set()
+        if resolve_trusted_local_media_path(source, name=name, suffixes=suffixes) is not None:
+            return True
+        if is_video:
+            return resolve_trusted_local_media_path(source, name=name, suffixes=None) is not None
+        return False
+
+    @classmethod
+    def _onebot_source_from_data(
+        cls,
+        data: dict[str, Any],
+        *,
+        kind: str = "",
+        require_existing_local: bool = False,
+    ) -> str:
+        source_keys = MEDIA_URL_SOURCE_KEYS + MEDIA_LOCAL_SOURCE_KEYS + MEDIA_BASE64_SOURCE_KEYS
+        for key in source_keys:
+            source = cls._usable_media_source(data.get(key))
+            if source:
+                if require_existing_local and not cls._onebot_local_source_exists(source, data, kind):
+                    continue
+                return source
+        return base64_media_source(data)
+
+    @staticmethod
+    def _onebot_media_name(data: dict[str, Any], source: str = "") -> str:
+        for key in ("name", "filename", "file_name", "fileName", "file"):
+            value = str(data.get(key) or "").strip()
+            if value and not QzoneStablePlugin._source_placeholder(value):
+                return source_name(value) or value
+        return source_name(source)
+
+    @staticmethod
+    def _onebot_media_size(data: dict[str, Any]) -> int:
+        for key in ("size", "file_size", "fileSize"):
+            try:
+                size = int(data.get(key) or 0)
+            except (TypeError, ValueError):
+                size = 0
+            if size > 0:
+                return size
+        return 0
+
+    @classmethod
+    def _onebot_post_media(
+        cls,
+        kind: str,
+        data: dict[str, Any],
+        source: str,
+        *,
+        require_existing_local: bool = False,
+    ) -> PostMedia | None:
+        source = cls._usable_media_source(source)
+        if not source:
+            return None
+        if require_existing_local and not cls._onebot_local_source_exists(source, data, kind):
+            return None
+        name = cls._onebot_media_name(data, source)
+        mime_type = str(data.get("mime_type") or data.get("mime") or guess_mime_type(name or source) or "")
+        media_kind = "video" if kind == "video" or is_video_media({"type": kind, **data, "source": source}) else kind
+        return PostMedia(
+            kind=media_kind,
+            source=source,
+            name=name,
+            mime_type=mime_type,
+            size=cls._onebot_media_size(data),
+            raw_type=kind,
+            trusted_local=True,
+        )
+
+    @classmethod
+    def _onebot_segment_is_video(cls, kind: str, data: dict[str, Any]) -> bool:
+        if kind == "video":
+            return True
+        name = cls._onebot_media_name(data, cls._onebot_source_from_data(data))
+        return is_video_media({"type": kind, **data, "name": name})
+
+    @staticmethod
+    def _onebot_identifier_stem(value: str) -> str:
+        text = str(value or "").strip()
+        if not text or text.startswith(("http://", "https://", "base64://", "data:", "file://")):
+            return ""
+        name = source_name(text) or text
+        suffix = Path(name).suffix.lower()
+        if suffix not in QZONE_VIDEO_SUFFIXES:
+            return ""
+        stem = Path(name).stem.strip()
+        return stem if stem and stem != text else ""
+
+    @classmethod
+    def _onebot_media_identifier_candidates(cls, data: dict[str, Any], *, kind: str = "") -> list[str]:
+        candidates: list[str] = []
+        for key in (
+            "file_id",
+            "fileId",
+            "file",
+            "file_",
+            "file_unique",
+            "fileUnique",
+            "file_uuid",
+            "fileUuid",
+            "fid",
+            "id",
+            "attachment_id",
+            "attachmentId",
+            "md5",
+            "sha",
+            "sha1",
+        ):
+            value = data.get(key)
+            if cls._source_placeholder(value):
+                continue
+            text = str(value or "").strip()
+            if text and text not in candidates:
+                candidates.append(text)
+        if kind == "video" or cls._onebot_segment_is_video(kind, data):
+            for value in list(candidates):
+                stem = cls._onebot_identifier_stem(value)
+                if stem and stem not in candidates:
+                    candidates.append(stem)
+        return candidates
+
+    @staticmethod
+    def _dedupe_onebot_action_calls(calls: Iterable[tuple[str, dict[str, Any]]]) -> list[tuple[str, dict[str, Any]]]:
+        result: list[tuple[str, dict[str, Any]]] = []
+        seen: set[tuple[str, tuple[tuple[str, str], ...]]] = set()
+        for action, params in calls:
+            key = (action, tuple(sorted((item_key, str(item_value)) for item_key, item_value in params.items())))
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append((action, params))
+        return result
+
+    @classmethod
+    def _onebot_video_file_action_calls(cls, data: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+        calls: list[tuple[str, dict[str, Any]]] = []
+        identifiers = cls._onebot_media_identifier_candidates(data, kind="video")
+        direct_file_keys = {"file", "file_", "attachment_id", "attachmentId"}
+        direct_id_keys = {
+            "file_id",
+            "fileId",
+            "file_unique",
+            "fileUnique",
+            "file_uuid",
+            "fileUuid",
+            "fid",
+            "id",
+            "md5",
+            "sha",
+            "sha1",
+        }
+        direct_files: set[str] = set()
+        direct_ids: set[str] = set()
+        for key in direct_file_keys:
+            value = data.get(key)
+            if not cls._source_placeholder(value):
+                text = str(value or "").strip()
+                if text:
+                    direct_files.add(text)
+                    stem = cls._onebot_identifier_stem(text)
+                    if stem:
+                        direct_files.add(stem)
+        for key in direct_id_keys:
+            value = data.get(key)
+            if not cls._source_placeholder(value):
+                text = str(value or "").strip()
+                if text:
+                    direct_ids.add(text)
+                    stem = cls._onebot_identifier_stem(text)
+                    if stem:
+                        direct_ids.add(stem)
+        for value in identifiers:
+            param_variants: list[dict[str, Any]] = []
+            if value in direct_ids:
+                param_variants.extend(
+                    [
+                        {"file_id": value},
+                        {"type": "path", "file_id": value},
+                        {"type": "url", "file_id": value},
+                        {"type": "base64", "file_id": value},
+                        {"id": value},
+                    ]
+                )
+            if value in direct_files or value not in direct_ids:
+                param_variants.extend(
+                    [
+                        {"file": value},
+                        {"type": "path", "file": value},
+                        {"type": "url", "file": value},
+                        {"type": "base64", "file": value},
+                    ]
+                )
+            param_variants.extend([{"video": value}, {"id": value}])
+            for params in param_variants:
+                calls.append(("get_file", params))
+            for params in param_variants:
+                calls.append(("get_video", params))
+        return cls._dedupe_onebot_action_calls(calls)
+
+    def _onebot_file_url_action_calls(
+        self,
+        data: dict[str, Any],
+        event: AstrMessageEvent | None,
+    ) -> list[tuple[str, dict[str, Any]]]:
+        identifiers = self._onebot_media_identifier_candidates(data, kind="video")
+        if not identifiers:
+            return []
+        calls: list[tuple[str, dict[str, Any]]] = []
+        group_id = self._group_id(event) if event is not None else 0
+        busid = data.get("busid") or data.get("bus_id") or data.get("busId")
+        for file_id in identifiers:
+            group_params: list[dict[str, Any]] = []
+            for key in ("file_id", "file", "id"):
+                base = {key: file_id}
+                if not self._source_placeholder(busid):
+                    with_busid = {**base, "busid": busid}
+                    group_params.append(with_busid)
+                group_params.append(base)
+            if group_id:
+                for params in group_params:
+                    calls.append(("get_group_file_url", {"group_id": group_id, **params}))
+                    calls.append(("get_group_file_url", {"group": group_id, **params}))
+            for key in ("file_id", "file", "id"):
+                calls.append(("get_private_file_url", {key: file_id}))
+                calls.append(("get_file_url", {key: file_id}))
+                calls.append(("get_video_url", {key: file_id}))
+        return self._dedupe_onebot_action_calls(calls)
+
+    def _iter_onebot_segments(self, payload: Any, *, seen: set[int] | None = None, depth: int = 0) -> list[Any]:
+        if depth > 6 or payload in (None, "", [], (), {}):
+            return []
+        if seen is None:
+            seen = set()
+        if not isinstance(payload, (str, bytes, bytearray, int, float, bool)):
+            marker = id(payload)
+            if marker in seen:
+                return []
+            seen.add(marker)
+
+        if isinstance(payload, str):
+            return parse_cq_message(payload)
+        if isinstance(payload, (list, tuple, set)):
+            segments: list[Any] = []
+            for item in payload:
+                segments.extend(self._iter_onebot_segments(item, seen=seen, depth=depth + 1))
+            return segments
+        segments = []
+        if isinstance(payload, dict):
+            kind = payload.get("type") or payload.get("kind")
+            if kind:
+                segments.append(payload)
+            data = payload.get("data")
+            owners = [payload]
+            if isinstance(data, dict):
+                owners.append(data)
+            for owner in owners:
+                for key in (
+                    "message",
+                    "messages",
+                    "message_chain",
+                    "raw_message",
+                    "raw_messages",
+                    "message_segments",
+                    "media",
+                    "medias",
+                    "attachment",
+                    "attachments",
+                    "files",
+                ):
+                    if key in owner:
+                        segments.extend(self._iter_onebot_segments(owner.get(key), seen=seen, depth=depth + 1))
+            return segments
+
+        kind = self._onebot_segment_kind(payload)
+        if kind:
+            segments.append(payload)
+        for key in ("message", "messages", "chain", "message_chain", "raw_message"):
+            if hasattr(payload, key):
+                try:
+                    nested = getattr(payload, key)
+                except Exception:
+                    continue
+                segments.extend(self._iter_onebot_segments(nested, seen=seen, depth=depth + 1))
+        return segments
+
+    def _dedupe_media(self, items: Iterable[PostMedia]) -> list[PostMedia]:
+        result: list[PostMedia] = []
+        seen: set[tuple[str, str]] = set()
+        for item in items:
+            key = (item.kind, item.source)
+            if not item.source or key in seen:
+                continue
+            seen.add(key)
+            result.append(item)
+        return result
+
+    async def _onebot_get_file_media(
+        self,
+        bot: Any,
+        kind: str,
+        data: dict[str, Any],
+    ) -> PostMedia | None:
+        for action, params in self._onebot_video_file_action_calls(data):
+            try:
+                payload = await self._query_onebot_action(bot, action, **params)
+            except Exception as exc:
+                logger.debug("qzone OneBot %s failed params=%s: %s", action, params, exc)
+                continue
+            result = self._onebot_data_payload(payload)
+            if isinstance(result, dict):
+                merged = {**data, **result}
+                source = self._onebot_source_from_data(merged, kind=kind, require_existing_local=True)
+                media = self._onebot_post_media(kind, merged, source, require_existing_local=True)
+                if media is not None:
+                    return media
+            elif isinstance(result, str):
+                source = self._usable_media_source(result)
+                if source:
+                    source_key = "url" if source.startswith(("http://", "https://", "base64://", "data:")) else "file"
+                    merged = {**data, source_key: source}
+                    media = self._onebot_post_media(kind, merged, source, require_existing_local=True)
+                    if media is not None:
+                        return media
+        return None
+
+    async def _onebot_file_url_media(
+        self,
+        bot: Any,
+        kind: str,
+        data: dict[str, Any],
+        event: AstrMessageEvent | None,
+    ) -> PostMedia | None:
+        for action, params in self._onebot_file_url_action_calls(data, event):
+            try:
+                payload = await self._query_onebot_action(bot, action, **params)
+            except Exception as exc:
+                logger.debug("qzone OneBot %s failed params=%s: %s", action, params, exc)
+                continue
+            result = self._onebot_data_payload(payload)
+            if isinstance(result, dict):
+                merged = {**data, **result}
+                source = self._onebot_source_from_data(merged, kind=kind, require_existing_local=True)
+                media = self._onebot_post_media(kind, merged, source, require_existing_local=True)
+                if media is not None:
+                    return media
+            elif isinstance(result, str):
+                source = self._usable_media_source(result)
+                if source:
+                    source_key = "url" if source.startswith(("http://", "https://", "base64://", "data:")) else "file"
+                    merged = {**data, source_key: source}
+                    media = self._onebot_post_media(kind, merged, source, require_existing_local=True)
+                    if media is not None:
+                        return media
+        return None
+
+    async def _resolve_onebot_segment_media(
+        self,
+        bot: Any,
+        segment: Any,
+        *,
+        event: AstrMessageEvent | None,
+    ) -> PostMedia | None:
+        kind = self._onebot_segment_kind(segment)
+        if kind not in {"image", "video", "file", "record"}:
+            return None
+        data = self._onebot_segment_data(segment)
+        if kind == "file" and not self._onebot_segment_is_video(kind, data):
+            return None
+        source = self._onebot_source_from_data(data, kind=kind, require_existing_local=True)
+        media = self._onebot_post_media(kind, data, source, require_existing_local=True) if source else None
+        if media is not None:
+            return media
+        if kind in {"video", "file"}:
+            media = await self._onebot_get_file_media(bot, "video", data)
+            if media is not None:
+                return media
+            return await self._onebot_file_url_media(bot, "video", data, event)
+        return None
+
+    async def _onebot_payload_media(
+        self,
+        bot: Any,
+        payload: Any,
+        *,
+        event: AstrMessageEvent | None,
+    ) -> list[PostMedia]:
+        media: list[PostMedia] = []
+        for segment in self._iter_onebot_segments(payload):
+            item = await self._resolve_onebot_segment_media(bot, segment, event=event)
+            if item is not None:
+                media.append(item)
+        return self._dedupe_media(media)
+
+    async def _component_file_media(
+        self,
+        component: Any,
+        kind: str,
+        *,
+        bot: Any | None = None,
+        event: AstrMessageEvent | None = None,
+    ) -> PostMedia | None:
+        data = self._onebot_segment_data(component)
+        source = self._onebot_source_from_data(data, kind=kind, require_existing_local=True)
+        if source:
+            return self._onebot_post_media(kind, data, source, require_existing_local=True)
+        method_name = "get_file" if kind == "file" else "convert_to_file_path"
+        method = getattr(component, method_name, None)
+        if kind == "file" and not self._onebot_segment_is_video(kind, data):
+            return None
+        media_kind = "video" if kind == "file" and self._onebot_segment_is_video(kind, data) else kind
+        if callable(method):
+            try:
+                resolved = await self._maybe_await(method())
+            except Exception as exc:
+                logger.debug("qzone component media materialize failed kind=%s: %s", kind, exc)
+            else:
+                media = self._onebot_post_media(media_kind, data, str(resolved or ""), require_existing_local=True)
+                if media is not None:
+                    return media
+        if bot is not None and media_kind == "video":
+            media = await self._onebot_get_file_media(bot, "video", data)
+            if media is not None:
+                return media
+            return await self._onebot_file_url_media(bot, "video", data, event)
+        return None
+
+    async def _component_runtime_media(
+        self,
+        component: Any,
+        *,
+        seen: set[int],
+        bot: Any | None = None,
+        event: AstrMessageEvent | None = None,
+        depth: int = 0,
+    ) -> list[PostMedia]:
+        if depth > 6 or component in (None, "", [], (), {}):
+            return []
+        if not isinstance(component, (str, bytes, bytearray, int, float, bool)):
+            marker = id(component)
+            if marker in seen:
+                return []
+            seen.add(marker)
+        if isinstance(component, (list, tuple, set)):
+            media: list[PostMedia] = []
+            for item in component:
+                media.extend(
+                    await self._component_runtime_media(
+                        item,
+                        seen=seen,
+                        bot=bot,
+                        event=event,
+                        depth=depth + 1,
+                    )
+                )
+            return media
+        if isinstance(component, str):
+            return []
+
+        kind = self._onebot_segment_kind(component)
+        media: list[PostMedia] = []
+        if kind in {"image", "video", "record", "file"}:
+            item = await self._component_file_media(component, kind, bot=bot, event=event)
+            if item is not None:
+                media.append(item)
+        data = self._onebot_segment_data(component)
+        for key in ("chain", "message", "messages", "message_chain", "reply", "quoted", "quoted_message"):
+            nested = data.get(key)
+            if nested in (None, "", [], (), {}):
+                continue
+            media.extend(
+                await self._component_runtime_media(
+                    nested,
+                    seen=seen,
+                    bot=bot,
+                    event=event,
+                    depth=depth + 1,
+                )
+            )
+        result = self._dedupe_media(media)
+        if kind in {"reply", "quote", "quoted", "reference"}:
+            return collapse_single_video_cover_companion_media(result)
+        return result
+
+    async def _event_runtime_media(self, event: AstrMessageEvent) -> list[PostMedia]:
+        media: list[PostMedia] = []
+        seen: set[int] = set()
+        bot = self._capture_onebot_client(event)
+        for component in iter_event_components(event):
+            media.extend(await self._component_runtime_media(component, seen=seen, bot=bot, event=event))
+        if bot is not None:
+            message_obj = getattr(event, "message_obj", None)
+            for payload in (
+                getattr(message_obj, "raw_message", None),
+                getattr(event, "raw_message", None),
+            ):
+                media.extend(await self._onebot_payload_media(bot, payload, event=event))
+        return self._dedupe_media(media)
+
+    async def _referenced_message_media(self, event: AstrMessageEvent) -> list[PostMedia]:
+        message_ids = iter_reference_message_ids(event)
+        if not message_ids:
+            return []
+        bot = self._capture_onebot_client(event)
+        if bot is None:
+            return []
+        media: list[PostMedia] = []
+        for message_id in message_ids:
+            try:
+                payload = await self._query_onebot_message(bot, message_id)
+            except Exception as exc:
+                logger.debug("qzone referenced message lookup failed message_id=%s: %s", message_id, exc)
+                continue
+            data_payload = self._onebot_data_payload(payload)
+            message_media: list[PostMedia] = []
+            message_media.extend(await self._onebot_payload_media(bot, data_payload, event=event))
+            message_media.extend(collect_message_media(data_payload))
+            media.extend(collapse_single_video_cover_companion_media(self._dedupe_media(message_media)))
+        return self._dedupe_media(media)
+
+    async def _collect_target_post_payload(
+        self,
+        event: AstrMessageEvent,
+        content: str,
+        prefixes: tuple[str, ...],
+        *,
+        include_event_text: bool = True,
+        extra_media: Iterable[Any] | None = None,
+    ) -> PostPayload:
+        runtime_media = await self._event_runtime_media(event)
+        referenced_media = await self._referenced_message_media(event)
+        combined_extra_media: list[Any] = [*runtime_media, *referenced_media]
+        if extra_media is not None:
+            combined_extra_media.extend(extra_media)
+        post = collect_post_payload(
+            event,
+            fallback_content=content,
+            include_event_text=include_event_text,
+            command_prefixes=prefixes,
+            extra_media=combined_extra_media,
+        )
+        if not post.content.strip() and not post.media and not post.attachments:
+            message_ids = iter_reference_message_ids(event)
+            if message_ids:
+                component_kinds = [self._onebot_segment_kind(item) for item in iter_event_components(event)[:8]]
+                logger.warning(
+                    "qzone publish payload empty after referenced message lookup reference_ids=%s onebot_client=%s components=%s",
+                    [str(item) for item in message_ids],
+                    bool(self._capture_onebot_client(event)),
+                    component_kinds,
+                )
+        return post
+
+    async def _prepare_video_sources(self, post: PostPayload) -> PostPayload:
+        return await asyncio.to_thread(
+            materialize_video_sources,
+            post,
+            self.data_dir / "video_sources",
+        )
+
+    async def _prepare_publish_payload(self, post: PostPayload) -> PostPayload:
+        return await asyncio.to_thread(
+            materialize_video_covers,
+            post,
+            self.data_dir / "video_covers",
+        )
+
+    async def _publish_daemon_video_post(
+        self,
+        post: PostPayload,
+        *,
+        sync_weibo: bool,
+    ) -> dict[str, Any]:
+        return await self.controller.publish_post(
+            content=post.content,
+            sync_weibo=sync_weibo,
+            media=[item.to_dict() for item in [*post.media, *post.attachments]],
+            content_sanitized=True,
+        )
+
+    async def _publish_post_payload(
+        self,
+        post: PostPayload,
+        *,
+        sync_weibo: bool = False,
+        event: AstrMessageEvent | None = None,
+    ) -> tuple[PostPayload, dict[str, Any]]:
+        post = await self._prepare_video_sources(post)
+        render_post: PostPayload | None = None
+        if _post_contains_video_media(post):
+            if not getattr(self.settings, "native_video_publish", True):
+                raise QzoneParseError(
+                    "Video attachment detected but native_video_publish is disabled; refusing to publish a cover image as success. "
+                    "Enable native_video_publish and run /qzone autobind to bind Qzone Web Cookie/p_skey for the H5 "
+                    "private-create + permission-update + public-verification chain."
+                )
+            render_post = await self._prepare_publish_payload(post)
+            payload = await self._publish_daemon_video_post(post, sync_weibo=sync_weibo)
+            return render_post, payload
+
+        if render_post is None:
+            render_post = await self._prepare_publish_payload(post)
+        payload = await self.controller.publish_post(
+            content=render_post.content,
+            sync_weibo=sync_weibo,
+            media=[item.to_dict() for item in render_post.media],
+            content_sanitized=True,
+        )
+        return render_post, payload
+
+    async def _create_draft(self, event: AstrMessageEvent, post: PostPayload, *, anonymous: bool = False) -> DraftPost:
+        return await self.drafts.add_async(
+            author_uin=self._sender_id(event),
+            author_name=self._sender_name(event),
+            group_id=self._group_id(event),
+            content=post.content,
+            media=[item.to_dict() for item in post.media],
+            anonymous=anonymous,
+        )
+
+    async def _notify_review_target(self, event: AstrMessageEvent, draft: DraftPost, message: str) -> None:
+        bot = self._capture_onebot_sender(event)
+        if bot is None:
+            return
+        text = f"{message}\n{draft.preview(include_private=True)}"
+        rendered = await self._render_markdown_image(text, subdir="drafts")
+        outgoing: Any = text
+        if rendered is not None:
+            outgoing = [
+                {"type": "text", "data": {"text": f"{message}\n"}},
+                {"type": "image", "data": {"file": self._onebot_file_uri(rendered)}},
+            ]
+        try:
+            if self.settings.manage_group and hasattr(bot, "send_group_msg"):
+                result = bot.send_group_msg(group_id=self.settings.manage_group, message=outgoing)
+                await self._maybe_await(result)
+                return
+            if hasattr(bot, "send_private_msg"):
+                for admin in self.settings.admin_uins:
+                    result = bot.send_private_msg(user_id=admin, message=outgoing)
+                    await self._maybe_await(result)
+        except Exception as exc:
+            logger.debug("qzone draft review notification failed: %s", exc)
+
+    async def _notify_draft_author(self, event: AstrMessageEvent, draft: DraftPost, message: str) -> None:
+        bot = self._capture_onebot_sender(event)
+        if bot is None or not draft.author_uin:
+            return
+        try:
+            if draft.group_id and hasattr(bot, "send_group_msg"):
+                result = bot.send_group_msg(group_id=draft.group_id, message=message)
+            elif hasattr(bot, "send_private_msg"):
+                result = bot.send_private_msg(user_id=draft.author_uin, message=message)
+            else:
+                return
+            await self._maybe_await(result)
+        except Exception as exc:
+            logger.debug("qzone draft author notification failed: %s", exc)
+
+    def _draft_publish_content(self, draft: DraftPost) -> str:
+        content = draft.content.strip()
+        if not self.settings.show_name:
+            return content
+        name = "匿名者" if draft.anonymous else (draft.author_name or str(draft.author_uin or "未知用户"))
+        header = f"【来自 {name} 的投稿】"
+        return "\n\n".join(part for part in (header, content) if part)
+
+    def _auto_comment_state_path(self) -> Path:
+        return self.data_dir / "auto_comment_state.json"
+
+    def _auto_comment_state_store(self) -> AutoCommentStateStore:
+        return AutoCommentStateStore(self._auto_comment_state_path())
+
+    def _load_auto_comment_keys(self) -> set[str]:
+        return self._auto_comment_state_store().read_keys()
+
+    def _save_auto_comment_keys(self, keys: set[str]) -> None:
+        self._auto_comment_state_store().write_keys(keys)
+
+    def _auto_comment_key(self, post: QzonePost | FeedEntry) -> str:
+        return f"{int(getattr(post, 'hostuin', 0) or 0)}:{getattr(post, 'fid', '')}"
+
+    def _news_publish_state_path(self) -> Path:
+        return self.data_dir / "news_publish_state.json"
+
+    def _news_candidates_cache_path(self) -> Path:
+        return self.data_dir / "news_candidates.json"
+
+    def _load_news_publish_state(self) -> dict[str, Any]:
+        path = self._news_publish_state_path()
+        if not path.exists():
+            return {"published": []}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {"published": []}
+        if not isinstance(payload, dict):
+            return {"published": []}
+        published = payload.get("published")
+        if not isinstance(published, list):
+            payload["published"] = []
+        return payload
+
+    def _save_news_publish_state(self, payload: dict[str, Any]) -> None:
+        path = self._news_publish_state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        items = [item for item in payload.get("published") or [] if isinstance(item, dict)]
+        payload["published"] = items[-500:]
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    @staticmethod
+    def _news_item_from_dict(payload: Any) -> NewsItem | None:
+        if not isinstance(payload, dict):
+            return None
+        title = str(payload.get("title") or "").strip()
+        if not title:
+            return None
+        try:
+            published_at = int(payload.get("published_at") or 0)
+        except (TypeError, ValueError):
+            published_at = 0
+        return NewsItem(
+            title=title,
+            source=str(payload.get("source") or ""),
+            link=str(payload.get("link") or ""),
+            published_at=published_at,
+            scope=str(payload.get("scope") or ""),
+            item_id=str(payload.get("item_id") or ""),
+        )
+
+    def _save_news_candidates_cache(self, items: list[NewsItem], *, scope_text: str = "", requested_limit: int = 0) -> None:
+        path = self._news_candidates_cache_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "generated_at": datetime.now().isoformat(),
+            "scope": str(scope_text or ""),
+            "requested_limit": int(requested_limit or 0),
+            "items": [item.to_dict() for item in items],
+        }
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    def _load_news_candidates_cache(self) -> tuple[list[NewsItem], dict[str, Any]]:
+        path = self._news_candidates_cache_path()
+        if not path.exists():
+            return [], {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return [], {}
+        if not isinstance(payload, dict):
+            return [], {}
+        items: list[NewsItem] = []
+        for raw_item in payload.get("items") or []:
+            item = self._news_item_from_dict(raw_item)
+            if item is not None:
+                items.append(item)
+        return items, payload
+
+    @staticmethod
+    def _news_today_key() -> str:
+        return datetime.now().date().isoformat()
+
+    def _news_published_ids(self, state: dict[str, Any]) -> set[str]:
+        ids: set[str] = set()
+        for item in state.get("published") or []:
+            if not isinstance(item, dict):
+                continue
+            ids.update(str(value) for value in item.get("candidate_ids") or [] if value)
+            if item.get("id"):
+                ids.add(str(item["id"]))
+        return ids
+
+    def _news_scope_values(self, scope_override: str = "") -> list[str]:
+        if str(scope_override or "").strip():
+            return normalize_news_scopes(scope_override)
+        return list(getattr(self.settings, "news_scopes", None) or ["china"])
+
+    @staticmethod
+    def _news_candidate_limit(value: int | None = None, *, default: int = 12) -> int:
+        try:
+            raw = int(value if value is not None else default)
+        except (TypeError, ValueError):
+            raw = default
+        return max(1, min(raw, 50))
+
+    async def _news_candidates(
+        self,
+        *,
+        scope_override: str = "",
+        seen_ids: set[str] | None = None,
+        limit: int | None = None,
+    ) -> list[NewsItem]:
+        effective_limit = self._news_candidate_limit(
+            limit,
+            default=int(getattr(self.settings, "news_max_candidates", 12) or 12),
+        )
+        urls = google_news_rss_urls(
+            scopes=self._news_scope_values(scope_override),
+            keywords=list(getattr(self.settings, "news_keywords", []) or []),
+            custom_urls=list(getattr(self.settings, "news_custom_rss_urls", []) or []),
+        )
+        client = GoogleNewsRSSClient(
+            timeout=float(getattr(self.settings, "request_timeout", 15.0) or 15.0),
+            user_agent=str(getattr(self.settings, "user_agent", "") or ""),
+            trust_env=bool(getattr(self.settings, "news_trust_env", True)),
+        )
+        items = await client.fetch_items(urls)
+        recent = filter_recent_news(items, recency_hours=int(getattr(self.settings, "news_recency_hours", 36) or 36))
+        return merge_news_items(
+            recent,
+            limit=effective_limit,
+            seen_ids=seen_ids or set(),
+        )
+
+    async def _generate_news_post_text(self, event: AstrMessageEvent | None, items: list[NewsItem]) -> str:
+        return await self._llm_adapter().generate_news_post_text(event, items)
+
+    async def _generate_original_news_post_text(
+        self,
+        event: AstrMessageEvent | None,
+        items: list[NewsItem],
+    ) -> str:
+        for attempt in range(2):
+            text = (await self._generate_news_post_text(event, items)).strip()
+            if not text:
+                return ""
+            if not is_news_copy_like(text, items):
+                return text
+            logger.warning("qzone news publish generated copy-like text on attempt %s; retrying", attempt + 1)
+        return ""
+
+    @staticmethod
+    def _news_items_summary(items: list[NewsItem], *, limit: int = 3) -> str:
+        lines: list[str] = []
+        for item in items[:limit]:
+            source = f" - {item.source}" if item.source else ""
+            lines.append(f"- {truncate(item.title, 80)}{source}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _news_item_time_text(item: NewsItem) -> str:
+        if not item.published_at:
+            return ""
+        try:
+            return datetime.fromtimestamp(item.published_at).strftime("%Y-%m-%d %H:%M")
+        except (OverflowError, OSError, ValueError):
+            return ""
+
+    def _format_news_candidates(
+        self,
+        items: list[NewsItem],
+        *,
+        title: str = "新闻候选列表",
+        cache_info: dict[str, Any] | None = None,
+    ) -> str:
+        lines = [f"{title}（按发布时间从新到旧排序）"]
+        generated_at = str((cache_info or {}).get("generated_at") or "").strip()
+        if generated_at:
+            lines.append(f"生成时间：{generated_at[:19].replace('T', ' ')}")
+        for index, item in enumerate(items, start=1):
+            meta: list[str] = []
+            if item.source:
+                meta.append(f"来源：{item.source}")
+            time_text = self._news_item_time_text(item)
+            if time_text:
+                meta.append(f"时间：{time_text}")
+            if item.scope:
+                meta.append(f"范围：{item.scope}")
+            suffix = f"\n   {'；'.join(meta)}" if meta else ""
+            lines.append(f"{index}. {truncate(item.title, 90)}{suffix}")
+        lines.append("")
+        lines.append("发布：新闻说说 发布 <序号>；预览：新闻说说 预览 <序号>")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _parse_news_fetch_args(text: str, *, default_limit: int = 12) -> tuple[int, str]:
+        raw = str(text or "").strip()
+        limit = default_limit
+        match = re.search(r"\d+", raw)
+        if match:
+            limit = int(match.group(0))
+            raw = (raw[: match.start()] + " " + raw[match.end() :]).strip()
+        scope_text = re.sub(r"\s+", " ", raw).strip()
+        return QzoneStablePlugin._news_candidate_limit(limit, default=default_limit), scope_text
+
+    @staticmethod
+    def _parse_news_selection(text: str, *, default: int = 1) -> int:
+        match = re.search(r"-?\d+", str(text or ""))
+        if not match:
+            return default
+        try:
+            return int(match.group(0))
+        except ValueError:
+            return default
+
+    @staticmethod
+    def _selected_news_items(items: list[NewsItem], index: int) -> list[NewsItem]:
+        if not items:
+            return []
+        if index < 0:
+            index = len(items) + index + 1
+        if index < 1 or index > len(items):
+            return []
+        return [items[index - 1]]
+
+    def _record_news_publish(
+        self,
+        state: dict[str, Any],
+        *,
+        items: list[NewsItem],
+        post: PostPayload,
+        payload: dict[str, Any],
+    ) -> None:
+        today = self._news_today_key()
+        published = [item for item in state.get("published") or [] if isinstance(item, dict)]
+        primary = items[0] if items else NewsItem(title="")
+        published.append(
+            {
+                "date": today,
+                "id": primary.item_id,
+                "candidate_ids": [item.item_id for item in items if item.item_id],
+                "title": primary.title,
+                "source": primary.source,
+                "fid": str(payload.get("fid") or ""),
+                "content": truncate(post.content, 220),
+                "published_at": datetime.now().isoformat(),
+            }
+        )
+        state["last_date"] = today
+        state["published"] = published
+        self._save_news_publish_state(state)
+
+    async def _chat_history_context(self, event: AstrMessageEvent | None = None) -> str:
+        bot = self._capture_onebot_client(event)
+        if bot is None:
+            return ""
+        group_id = self._group_id(event) if event is not None else 0
+        if group_id and str(group_id) in self.settings.ignore_groups:
+            return ""
+        if not group_id:
+            group_id = await self._pick_history_group_id(bot)
+        if not group_id or str(group_id) in self.settings.ignore_groups:
+            return ""
+        lines = await self._fetch_group_history_lines(bot, group_id)
+        return "\n".join(lines[-self.settings.post_max_msg :])
+
+    async def _pick_history_group_id(self, bot: Any) -> int:
+        getter = getattr(bot, "get_group_list", None)
+        if not callable(getter):
+            return 0
+        try:
+            groups = await self._maybe_await(getter())
+        except Exception:
+            return 0
+        candidates: list[int] = []
+        for item in groups or []:
+            if not isinstance(item, dict):
+                continue
+            group_id = str(item.get("group_id") or "")
+            if group_id.isdigit() and group_id not in self.settings.ignore_groups:
+                candidates.append(int(group_id))
+        return random.choice(candidates) if candidates else 0
+
+    async def _fetch_group_history_lines(self, bot: Any, group_id: int) -> list[str]:
+        lines: list[str] = []
+        message_seq = 0
+        max_messages = max(1, int(self.settings.post_max_msg or 500))
+        while len(lines) < max_messages:
+            try:
+                result = await self._get_group_history_page(bot, group_id, message_seq)
+            except Exception as exc:
+                logger.debug("qzone group history fetch failed: %s", exc)
+                break
+            messages = result.get("messages") if isinstance(result, dict) else []
+            if not isinstance(messages, list) or not messages:
+                break
+            for message in messages:
+                line = self._history_message_to_line(message)
+                if line:
+                    lines.append(line)
+                    if len(lines) >= max_messages:
+                        break
+            first = messages[0] if isinstance(messages[0], dict) else {}
+            next_seq = int(first.get("message_id") or first.get("message_seq") or 0)
+            if not next_seq or next_seq == message_seq:
+                break
+            message_seq = next_seq
+        return lines
+
+    async def _get_group_history_page(self, bot: Any, group_id: int, message_seq: int) -> dict[str, Any]:
+        api = getattr(bot, "api", None)
+        call_action = getattr(api, "call_action", None)
+        payload = {
+            "group_id": int(group_id),
+            "message_seq": int(message_seq or 0),
+            "count": min(200, max(1, int(self.settings.post_max_msg or 500))),
+            "reverseOrder": True,
+        }
+        if callable(call_action):
+            return await self._maybe_await(call_action("get_group_msg_history", **payload))
+        getter = getattr(bot, "get_group_msg_history", None)
+        if callable(getter):
+            return await self._maybe_await(getter(**payload))
+        return {}
+
+    def _history_message_to_line(self, message: Any) -> str:
+        if not isinstance(message, dict):
+            return ""
+        sender = message.get("sender") if isinstance(message.get("sender"), dict) else {}
+        sender_id = str(sender.get("user_id") or message.get("user_id") or "")
+        if sender_id and sender_id in self.settings.ignore_users:
+            return ""
+        nickname = str(sender.get("card") or sender.get("nickname") or sender_id or "用户")
+        parts: list[str] = []
+        for segment in message.get("message") or []:
+            if not isinstance(segment, dict) or segment.get("type") != "text":
+                continue
+            data = segment.get("data") if isinstance(segment.get("data"), dict) else {}
+            text = str(data.get("text") or "").strip()
+            if text:
+                parts.append(text)
+        content = "".join(parts).strip()
+        if not content:
+            return ""
+        return f"{nickname}: {content}"
+
+    async def _generate_text(
+        self,
+        event: AstrMessageEvent,
+        prompt: str,
+        *,
+        provider_id: str = "",
+        system_prompt: str = "",
+    ) -> str:
+        return await self._llm_adapter().generate_text(
+            event,
+            prompt,
+            provider_id=provider_id,
+            system_prompt=system_prompt,
+        )
+
+    async def _generate_post_text(self, event: AstrMessageEvent, topic: str = "") -> str:
+        history = await self._chat_history_context(event)
+        return await self._llm_adapter().generate_post_text(event, topic, history=history)
+
+    async def _generate_comment_text(self, event: AstrMessageEvent, post: QzonePost) -> str:
+        return await self._llm_adapter().generate_comment_text(event, post)
+
+    async def _generate_auto_comment_pipeline(self, post: QzonePost) -> AutoCommentPipelineResult:
+        config = AutoCommentPipelineConfig(
+            enabled=bool(getattr(self.settings, "comment_pipeline_enabled", True)),
+            judgment_provider_id=str(getattr(self.settings, "comment_judgment_provider_id", "") or ""),
+            reasoning_provider_id=str(getattr(self.settings, "comment_reasoning_provider_id", "") or ""),
+            execution_provider_id=str(getattr(self.settings, "comment_execution_provider_id", "") or ""),
+            skip_checkins=bool(getattr(self.settings, "comment_skip_checkins", True)),
+            max_comment_length=int(getattr(self.settings, "comment_max_length", 60) or 60),
+        )
+        pipeline = AutoCommentPipeline(config)
+
+        async def generate_stage(prompt: str, provider_id: str, system_prompt: str) -> str:
+            try:
+                return await self._generate_text(None, prompt, provider_id=provider_id, system_prompt=system_prompt)  # type: ignore[arg-type]
+            except Exception as exc:
+                logger.debug("qzone auto-comment pipeline stage failed: %s", exc)
+                return ""
+
+        async def execute_comment(reasoning: str) -> str:
+            if config.execution_provider_id:
+                try:
+                    return await self._llm_adapter().generate_comment_text(
+                        None,  # type: ignore[arg-type]
+                        post,
+                        provider_id=config.execution_provider_id,
+                        reasoning=reasoning,
+                    )
+                except Exception as exc:
+                    logger.debug("qzone auto-comment execution provider failed: %s", exc)
+            return await self._generate_comment_text(None, post)  # type: ignore[arg-type]
+
+        return await pipeline.run(post, generate_text=generate_stage, execute_comment=execute_comment)
+
+    async def _generate_reply_text(self, event: AstrMessageEvent, post: QzonePost, comment: QzoneComment) -> str:
+        return await self._llm_adapter().generate_reply_text(event, post, comment)
+
+    @staticmethod
+    def _life_context_text(life_data: Any) -> str:
+        if not life_data:
+            return "暂无今日生活日程。"
+        if isinstance(life_data, str):
+            return life_data.strip() or "暂无今日生活日程。"
+        if not isinstance(life_data, dict):
+            try:
+                life_data = {
+                    key: getattr(life_data, key)
+                    for key in ("outfit", "schedule", "timeline", "meta")
+                    if getattr(life_data, key, None) not in (None, "", [], {})
+                }
+            except Exception:
+                return str(life_data).strip() or "暂无今日生活日程。"
+
+        lines: list[str] = []
+        meta = life_data.get("meta") if isinstance(life_data.get("meta"), dict) else {}
+        style = str(meta.get("style") or life_data.get("outfit_style") or "").strip()
+        outfit = str(life_data.get("outfit") or "").strip()
+        schedule = str(life_data.get("schedule") or "").strip()
+        if style:
+            lines.append(f"穿搭风格：{style}")
+        if outfit:
+            lines.append(f"今日穿搭：{outfit}")
+        if schedule:
+            lines.append(f"今日日程：{schedule}")
+
+        timeline = life_data.get("timeline")
+        if isinstance(timeline, list) and timeline:
+            timeline_lines: list[str] = []
+            for item in timeline[:8]:
+                if isinstance(item, dict):
+                    time_text = str(item.get("time") or item.get("at") or item.get("start") or "").strip()
+                    content = str(item.get("content") or item.get("activity") or item.get("text") or "").strip()
+                    text = " ".join(part for part in (time_text, content) if part).strip()
+                else:
+                    text = str(item or "").strip()
+                if text:
+                    timeline_lines.append(text)
+            if timeline_lines:
+                lines.append("时间线：" + "；".join(timeline_lines))
+        return "\n".join(lines).strip() or "暂无今日生活日程。"
+
+    async def _get_life_context(self) -> tuple[dict[str, Any], str]:
+        if not getattr(self.settings, "life_publish_use_life_context", True):
+            return {}, "日程上下文开关已关闭。"
+        plugin = self._life_scheduler_plugin()
+        if plugin is None:
+            raise RuntimeError("未找到 Life Scheduler 插件实例")
+        getter = getattr(plugin, "get_life_context", None)
+        if not callable(getter):
+            raise RuntimeError("Life Scheduler 插件未提供 get_life_context()")
+        data = await self._maybe_await(getter())
+        if data is None:
+            data = {}
+        if not isinstance(data, dict):
+            text = self._life_context_text(data)
+            return {"raw": data}, text
+        return data, self._life_context_text(data)
+
+    @staticmethod
+    def _format_life_prompt_template(template: str, *, life_context: str) -> str:
+        try:
+            return template.format(life_context=life_context)
+        except Exception:
+            return f"{template}\n\n{life_context}"
+
+    @staticmethod
+    def _clean_life_publish_text(text: str, *, fallback: str = "") -> str:
+        cleaned = QzoneLLM._clean_generated_text(
+            text,
+            fields=("content", "caption", "prompt", "text", "message", "action"),
+            fallback=fallback,
+        )
+        return cleaned.strip()
+
+    @staticmethod
+    def _fallback_life_image_prompt(life_context: str) -> str:
+        context = QzoneStablePlugin._clean_life_publish_text(life_context) or "今日份日常生活"
+        return f"真实手机自拍，{context}，自然光线，生活感场景，构图自然，画面清晰。"
+
+    async def _generate_life_image_prompt(self, event: AstrMessageEvent | None, life_context: str) -> str:
+        template = str(getattr(self.settings, "life_publish_image_prompt_template", "") or "").strip()
+        prompt = self._format_life_prompt_template(template, life_context=life_context).strip()
+        fallback_prompt = self._fallback_life_image_prompt(life_context)
+        if not prompt:
+            prompt = fallback_prompt
+        if not getattr(self.settings, "life_publish_use_llm_image_prompt", True):
+            return self._clean_life_publish_text(prompt, fallback=fallback_prompt) or fallback_prompt
+        system_prompt = (
+            "你是给 OmniDraw 自拍模式写画面动作/场景提示词的助手。"
+            "只输出最终提示词，不要输出 JSON、解释、标题或编号。"
+            "提示词要适合 generate_selfie：包含动作、场景、穿搭、光线、构图和生活氛围。"
+        )
+        call_event = event or self._scheduled_plugin_event(prompt=prompt)
+        text = await self._llm_adapter().generate_text(
+            call_event,
+            prompt,
+            provider_id=self.settings.post_provider_id,
+            system_prompt=system_prompt,
+            prefer_current_provider=True,
+        )
+        cleaned = self._clean_life_publish_text(text)
+        if cleaned:
+            return cleaned
+        fallback = self._clean_life_publish_text(fallback_prompt, fallback=fallback_prompt) or fallback_prompt
+        logger.debug("qzone life publish image prompt fell back to template prompt")
+        return fallback
+
+    async def _generate_life_caption(
+        self,
+        event: AstrMessageEvent | None,
+        *,
+        life_context: str,
+        image_prompt: str,
+    ) -> str:
+        static_caption = str(getattr(self.settings, "life_publish_static_caption", "") or "").strip()
+        if not getattr(self.settings, "life_publish_auto_caption", True):
+            return static_caption
+        template = str(getattr(self.settings, "life_publish_caption_prompt", "") or "").strip()
+        try:
+            prompt = template.format(life_context=life_context, image_prompt=image_prompt)
+        except Exception:
+            prompt = f"{template}\n\n日程上下文：\n{life_context}\n\n自拍提示词：\n{image_prompt}"
+        system_prompt = (
+            "你是 QQ 空间说说文案助手。只输出最终可发布的简短中文说说，"
+            "不要解释，不要输出 JSON/Markdown/标题，语气自然有生活感。"
+        )
+        text = await self._llm_adapter().generate_text(
+            event,
+            prompt,
+            provider_id=self.settings.post_provider_id,
+            system_prompt=system_prompt,
+            prefer_current_provider=True,
+        )
+        return self._clean_life_publish_text(text, fallback=static_caption) or static_caption
+
+    def _scheduled_plugin_event(self, *, prompt: str = "") -> Any:
+        sender_id = int((self.settings.admin_uins or [0])[0] or 0)
+        group_id = int(getattr(self.settings, "manage_group", 0) or 0)
+        message_text = str(prompt or "").strip()
+        message_obj = SimpleNamespace(
+            message=[],
+            message_str=message_text,
+            sender=SimpleNamespace(user_id=sender_id, nickname="定时自动发布"),
+            group_id=group_id,
+        )
+
+        class _ScheduledEvent:
+            def __init__(self, sender: int, group: int, text: str, obj: Any):
+                self.message_obj = obj
+                self.message_str = text
+                self.sender_id = sender
+                self.user_id = sender
+                self.group_id = group
+                self.unified_msg_origin = f"aiocqhttp:group:{group}" if group else f"aiocqhttp:private:{sender}"
+
+            def get_sender_id(self) -> int:
+                return self.sender_id
+
+            def get_sender_name(self) -> str:
+                return "定时自动发布"
+
+            def get_sender_nickname(self) -> str:
+                return "定时自动发布"
+
+            def get_group_id(self) -> int:
+                return self.group_id
+
+            def get_message_type(self) -> str:
+                return "group" if self.group_id else "private"
+
+            def get_session_id(self) -> str:
+                return self.unified_msg_origin
+
+        return _ScheduledEvent(sender_id, group_id, message_text, message_obj)
+
+    @staticmethod
+    def _parse_omnidraw_result(raw: Any) -> dict[str, Any]:
+        if isinstance(raw, dict):
+            return raw
+        if isinstance(raw, str):
+            text = raw.strip()
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                return {"success": False, "message": text, "images": []}
+            return parsed if isinstance(parsed, dict) else {"success": False, "message": text, "images": []}
+        return {"success": False, "message": str(raw or ""), "images": []}
+
+    @staticmethod
+    def _omnidraw_image_source(image: Any) -> str:
+        if isinstance(image, str):
+            return image.strip()
+        if not isinstance(image, dict):
+            return ""
+        for key in ("file_path", "url", "image_url", "data_url", "source", "path", "file"):
+            value = str(image.get(key) or "").strip()
+            if value:
+                return value
+        return ""
+
+    def _omnidraw_images_to_media(self, result: dict[str, Any]) -> list[PostMedia]:
+        sources: list[str] = []
+        for item in result.get("images") or []:
+            source = self._omnidraw_image_source(item)
+            if source and source not in sources:
+                sources.append(source)
+        return normalize_media_list(sources, default_kind="image", trusted_local=True)
+
+    @staticmethod
+    def _life_publish_image_retry_count(settings: Any) -> int:
+        try:
+            retry_count = int(getattr(settings, "life_publish_image_retry_count", 1) or 0)
+        except (TypeError, ValueError):
+            retry_count = 1
+        return max(0, min(retry_count, 5))
+
+    async def _call_omnidraw_selfie_return_result(
+        self,
+        method: Any,
+        call_event: Any,
+        image_prompt: str,
+        kwargs: dict[str, Any],
+    ) -> Any:
+        try:
+            signature = inspect.signature(method)
+        except (TypeError, ValueError):
+            signature = None
+        parameters = signature.parameters if signature is not None else {}
+        accepts_var_kwargs = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values())
+        accepts_var_positional = any(param.kind == inspect.Parameter.VAR_POSITIONAL for param in parameters.values())
+        call_args: list[Any] = []
+        call_kwargs: dict[str, Any] = {}
+
+        if "event" in parameters or accepts_var_kwargs:
+            call_kwargs["event"] = call_event
+
+        if "action" in parameters or accepts_var_kwargs:
+            call_kwargs["action"] = image_prompt
+        elif "prompt" in parameters:
+            call_kwargs["prompt"] = image_prompt
+        elif accepts_var_positional:
+            call_args.append(image_prompt)
+
+        for key, value in kwargs.items():
+            if key in {"event", "action", "prompt"}:
+                continue
+            if key in parameters or accepts_var_kwargs:
+                call_kwargs[key] = value
+
+        return await self._maybe_await(method(*call_args, **call_kwargs))
+
+    async def _generate_life_selfie_media(
+        self,
+        event: AstrMessageEvent | None,
+        image_prompt: str,
+    ) -> tuple[list[PostMedia], dict[str, Any]]:
+        if not getattr(self.settings, "life_publish_use_omnidraw_selfie", True):
+            return [], {"success": False, "message": "OmniDraw 自拍开关已关闭", "images": []}
+        plugin = self._omnidraw_plugin()
+        if plugin is None:
+            raise RuntimeError("未找到 OmniDraw 插件实例")
+        method = getattr(plugin, "generate_selfie", None)
+        if not callable(method):
+            method = getattr(plugin, "tool_generate_selfie", None)
+        if not callable(method):
+            raise RuntimeError("OmniDraw 插件未提供 generate_selfie/tool_generate_selfie")
+        call_event = event or self._scheduled_plugin_event(prompt=image_prompt)
+        kwargs = {
+            "action": image_prompt,
+            "count": 1,
+            "aspect_ratio": str(getattr(self.settings, "life_publish_aspect_ratio", "") or ""),
+            "size": str(getattr(self.settings, "life_publish_size", "") or ""),
+            "extra_params": str(getattr(self.settings, "life_publish_extra_params", "") or ""),
+            "return_result": True,
+            "refs": "",
+        }
+        max_retries = self._life_publish_image_retry_count(self.settings)
+        total_attempts = max_retries + 1
+        last_result: dict[str, Any] = {"success": False, "message": "", "images": []}
+        last_exception: Exception | None = None
+        for attempt_index in range(1, total_attempts + 1):
+            try:
+                raw_result = await self._call_omnidraw_selfie_return_result(method, call_event, image_prompt, kwargs)
+                result = self._parse_omnidraw_result(raw_result)
+                media = self._omnidraw_images_to_media(result)
+                if media:
+                    if attempt_index > 1:
+                        logger.info(
+                            "qzone life publish OmniDraw selfie succeeded after retry attempt=%s/%s",
+                            attempt_index,
+                            total_attempts,
+                        )
+                    return media, result
+                message = str(result.get("message") or "OmniDraw 未返回可发布图片").strip()
+                result.setdefault("message", message)
+                last_result = result
+                if attempt_index < total_attempts:
+                    logger.warning(
+                        "qzone life publish OmniDraw selfie returned no image attempt=%s/%s; retrying: %s",
+                        attempt_index,
+                        total_attempts,
+                        message,
+                    )
+            except Exception as exc:
+                last_exception = exc
+                if attempt_index >= total_attempts:
+                    raise
+                logger.warning(
+                    "qzone life publish OmniDraw selfie failed attempt=%s/%s; retrying: %s",
+                    attempt_index,
+                    total_attempts,
+                    exc,
+                )
+            if attempt_index < total_attempts:
+                await asyncio.sleep(min(0.5, 0.1 * attempt_index))
+        if last_exception is not None:
+            raise last_exception
+        return [], last_result
+
+    async def _create_scheduled_draft(self, post: PostPayload, *, message: str) -> DraftPost:
+        draft = await self.drafts.add_async(
+            author_uin=0,
+            author_name="定时自动发布",
+            group_id=0,
+            content=post.content,
+            media=[item.to_dict() for item in post.media],
+            anonymous=False,
+        )
+        if getattr(self.settings, "send_admin", False):
+            bot = self._capture_onebot_client(None)
+            if bot is not None:
+                text = f"{message}\n{draft.preview(include_private=True)}"
+                rendered = await self._render_markdown_image(text, subdir="drafts")
+                outgoing: Any = text
+                if rendered is not None:
+                    outgoing = [
+                        {"type": "text", "data": {"text": f"{message}\n"}},
+                        {"type": "image", "data": {"file": self._onebot_file_uri(rendered)}},
+                    ]
+                await self._send_admin_outgoing(bot, outgoing)
+        return draft
+
+    async def _publish_or_draft_scheduled_post(
+        self,
+        post: PostPayload,
+        *,
+        event: AstrMessageEvent | None = None,
+        force_publish: bool = False,
+        notify_admin: bool = True,
+    ) -> LifePublishResult:
+        mode = str(getattr(self.settings, "life_publish_mode", "publish") or "publish").lower()
+        if mode == "draft" and not force_publish:
+            draft = await self._create_scheduled_draft(post, message="定时生活说说已生成草稿")
+            logger.info("qzone scheduled life publish created draft id=%s text_length=%s", draft.id, len(post.content))
+            return LifePublishResult({"draft_id": draft.id, "mode": "draft", "message": "created draft"}, post)
+        await self._ensure_cookie_ready(event)
+        await self._ensure_daemon()
+        payload = await self.controller.publish_post(
+            content=post.content,
+            media=[item.to_dict() for item in post.media],
+            content_sanitized=True,
+        )
+        logger.info(
+            "qzone scheduled life publish succeeded fid=%s text_length=%s media_count=%s",
+            payload.get("fid") or "",
+            len(post.content),
+            len(post.media),
+        )
+        if notify_admin:
+            await self._notify_admin_publish_result(post, payload, "日常说说发布完成")
+        return LifePublishResult(payload, post)
+
+    async def _auto_life_publish_once(
+        self,
+        event: AstrMessageEvent | None = None,
+        *,
+        force_publish: bool = False,
+        notify_admin: bool = True,
+    ) -> dict[str, Any] | None:
+        logger.info(
+            "qzone scheduled life publish started event=%s force_publish=%s mode=%s failure_policy=%s use_life_context=%s use_llm_image_prompt=%s use_omnidraw_selfie=%s auto_caption=%s image_retry_count=%s",
+            bool(event),
+            force_publish,
+            getattr(self.settings, "life_publish_mode", "publish"),
+            getattr(self.settings, "life_publish_failure_policy", "skip"),
+            getattr(self.settings, "life_publish_use_life_context", True),
+            getattr(self.settings, "life_publish_use_llm_image_prompt", True),
+            getattr(self.settings, "life_publish_use_omnidraw_selfie", True),
+            getattr(self.settings, "life_publish_auto_caption", True),
+            self._life_publish_image_retry_count(self.settings),
+        )
+        life_data: dict[str, Any] = {}
+        try:
+            life_data, life_context = await self._get_life_context()
+        except Exception as exc:
+            if getattr(self.settings, "life_publish_use_life_context", True):
+                logger.warning("qzone scheduled life publish skipped: life context failed: %s", exc)
+                if self.settings.life_publish_failure_policy != "text_only":
+                    return
+            life_context = "暂无今日生活日程。"
+
+        image_prompt = ""
+        media: list[PostMedia] = []
+        omnidraw_result: dict[str, Any] = {"success": False, "images": []}
+        image_flow_failed = False
+        try:
+            image_prompt = await self._generate_life_image_prompt(event, life_context)
+            if not image_prompt.strip():
+                raise RuntimeError("LLM 未生成自拍提示词")
+            media, omnidraw_result = await self._generate_life_selfie_media(event, image_prompt)
+            if not media:
+                raise RuntimeError(str(omnidraw_result.get("message") or "OmniDraw 未返回图片"))
+        except Exception as exc:
+            image_flow_failed = True
+            logger.warning("qzone scheduled life publish image flow failed: %s", exc, exc_info=True)
+            if self.settings.life_publish_failure_policy != "text_only":
+                return
+
+        try:
+            caption = await self._generate_life_caption(event, life_context=life_context, image_prompt=image_prompt)
+        except Exception as exc:
+            logger.warning("qzone scheduled life publish caption failed: %s", exc, exc_info=True)
+            if self.settings.life_publish_failure_policy != "text_only":
+                return
+            caption = str(getattr(self.settings, "life_publish_static_caption", "") or "")
+        if image_flow_failed and not media and not caption.strip():
+            return
+        content = (caption or str(getattr(self.settings, "life_publish_static_caption", "") or "")).strip()
+        if not content:
+            content = "今日份生活碎片。"
+        post = PostPayload(content=content, media=media)
+        payload = await self._publish_or_draft_scheduled_post(
+            post,
+            event=event,
+            force_publish=force_publish,
+            notify_admin=notify_admin,
+        )
+        logger.info(
+            "qzone scheduled life publish finished mode=%s media_count=%s life_keys=%s omnidraw_success=%s",
+            "publish" if force_publish else getattr(self.settings, "life_publish_mode", "publish"),
+            len(media),
+            ",".join(sorted(life_data.keys())) if isinstance(life_data, dict) else "",
+            bool(omnidraw_result.get("success")),
+        )
+        return payload
+
+    @staticmethod
+    def _cron_delay_seconds(cron: str, offset_seconds: int) -> float:
+        return cron_delay_seconds(cron, offset_seconds, now=datetime.now(), randint=random.randint)
+
+    @staticmethod
+    def _scheduled_task_label(name: str) -> str:
+        return f"qzone-scheduled-{name}"
+
+    def _has_active_scheduled_task(self, name: str) -> bool:
+        label = self._scheduled_task_label(name)
+        for task in self._scheduled_tasks:
+            if task.done():
+                continue
+            get_name = getattr(task, "get_name", None)
+            if callable(get_name) and get_name() == label:
+                return True
+        return False
+
+    def _create_scheduled_task(self, name: str, cron: str, offset: int, action: Any) -> None:
+        if self._has_active_scheduled_task(name):
+            return
+        coro = self._scheduled_loop(name, cron, offset, action)
+        label = self._scheduled_task_label(name)
+        try:
+            task = asyncio.create_task(coro, name=label)
+        except TypeError:
+            task = asyncio.create_task(coro)
+        self._scheduled_tasks.append(task)
+
+    def _start_scheduled_tasks(self) -> None:
+        self._scheduled_tasks = [task for task in self._scheduled_tasks if not task.done()]
+        if self.settings.publish_cron:
+            logger.info(
+                "qzone scheduled publish configured cron=%s offset=%s life_publish_enabled=%s life_mode=%s life_failure_policy=%s",
+                self.settings.publish_cron,
+                self.settings.publish_offset,
+                getattr(self.settings, "life_publish_enabled", False),
+                getattr(self.settings, "life_publish_mode", "publish"),
+                getattr(self.settings, "life_publish_failure_policy", "skip"),
+            )
+            self._create_scheduled_task(
+                "publish",
+                self.settings.publish_cron,
+                self.settings.publish_offset,
+                self._auto_publish_once,
+            )
+        if getattr(self.settings, "news_cron", ""):
+            self._create_scheduled_task(
+                "news",
+                self.settings.news_cron,
+                self.settings.news_offset,
+                self._auto_news_publish_once,
+            )
+        if self.settings.comment_cron:
+            self._create_scheduled_task(
+                "comment",
+                self.settings.comment_cron,
+                self.settings.comment_offset,
+                self._auto_comment_once,
+            )
+
+    async def _scheduled_loop(self, name: str, cron: str, offset: int, action: Any) -> None:
+        while True:
+            delay = self._cron_delay_seconds(cron, offset)
+            if delay <= 0:
+                logger.info("qzone scheduled %s disabled: invalid cron=%s", name, cron)
+                return
+            logger.info("qzone scheduled %s next run in %.1fs cron=%s offset=%s", name, delay, cron, offset)
+            await asyncio.sleep(delay)
+            try:
+                logger.info("qzone scheduled %s run started", name)
+                await action()
+                logger.info("qzone scheduled %s run finished", name)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("qzone scheduled %s failed: %s", name, exc)
+
+    async def _auto_publish_once(self) -> None:
+        life_enabled = getattr(self.settings, "life_publish_enabled", False)
+        logger.info("qzone scheduled publish started life_publish_enabled=%s", life_enabled)
+        if life_enabled:
+            logger.info("qzone scheduled publish routed to life flow")
+            await self._auto_life_publish_once()
+            return
+        fake_event = None
+        text = await self._generate_post_text(fake_event, "")  # type: ignore[arg-type]
+        if not text.strip():
+            logger.info("qzone scheduled publish skipped: generated content is empty")
+            return
+        post = PostPayload(content=text.strip(), media=[])
+        await self._ensure_cookie_ready()
+        await self._ensure_daemon()
+        payload = await self.controller.publish_post(content=post.content, content_sanitized=True)
+        logger.info(
+            "qzone scheduled publish succeeded fid=%s text_length=%s",
+            payload.get("fid") or "",
+            len(post.content),
+        )
+        await self._notify_admin_publish_result(post, payload, "定时自动发布完成")
+
+    async def _auto_news_publish_once(self) -> None:
+        logger.info("qzone scheduled news publish started")
+        state = self._load_news_publish_state()
+        today = self._news_today_key()
+        if bool(getattr(self.settings, "news_once_per_day", True)) and state.get("last_date") == today:
+            logger.info("qzone scheduled news publish skipped: already published today")
+            return
+
+        items = await self._news_candidates(seen_ids=self._news_published_ids(state))
+        if not items:
+            logger.info("qzone scheduled news publish skipped: no fresh news candidates")
+            return
+
+        text = await self._generate_original_news_post_text(None, items)
+        if not text.strip():
+            logger.info("qzone scheduled news publish skipped: generated content is empty or copy-like")
+            return
+
+        post = PostPayload(content=text.strip(), media=[])
+        await self._ensure_cookie_ready()
+        await self._ensure_daemon()
+        payload = await self.controller.publish_post(content=post.content, content_sanitized=True)
+        self._record_news_publish(state, items=items, post=post, payload=payload)
+        logger.info(
+            "qzone scheduled news publish succeeded fid=%s text_length=%s candidates=%s",
+            payload.get("fid") or "",
+            len(post.content),
+            len(items),
+        )
+        summary = self._news_items_summary(items, limit=1)
+        message = "新闻自动发布完成"
+        if summary:
+            message = f"{message}\n参考新闻：\n{summary}"
+        await self._notify_admin_publish_result(post, payload, message)
+
+    def _scheduled_comment_target_count(self) -> int:
+        configured = int(getattr(self.settings, "comment_latest_count", 1) or 1)
+        max_limit = int(getattr(self.settings, "max_feed_limit", 20) or 20)
+        return max(1, min(configured, max(1, max_limit)))
+
+    async def _auto_comment_once(self) -> None:
+        target_count = self._scheduled_comment_target_count()
+        max_limit = max(1, int(getattr(self.settings, "max_feed_limit", 20) or 20))
+        fetch_limit = min(max_limit, max(5, target_count * 3))
+        logger.info("qzone scheduled comment started target_count=%s fetch_limit=%s", target_count, fetch_limit)
+        await self._ensure_cookie_ready()
+        await self._ensure_daemon()
+        payload = await self.controller.list_feeds(hostuin=0, limit=fetch_limit, scope="active")
+        entries = list(self._to_feed_entries(payload))
+        random.shuffle(entries)  # 最近若干条里随机挑，避免总是评论同一条
+        commented_keys = self._load_auto_comment_keys()
+        login_uin = 0
+        try:
+            status = await self.controller.get_status(probe_daemon=False)
+            login_uin = int(status.get("login_uin") or 0)
+        except Exception as exc:
+            logger.warning("qzone auto-comment: status probe failed, cannot determine login_uin: %s", exc)
+            return
+        commented = 0
+        skipped_self = 0
+        skipped_duplicate = 0
+        skipped_empty = 0
+        skipped_detail = 0
+        for entry in entries:
+            if commented >= target_count:
+                break
+            if not entry.fid or not entry.hostuin:
+                skipped_empty += 1
+                continue
+            if login_uin and entry.hostuin == login_uin:
+                skipped_self += 1
+                continue
+            key = self._auto_comment_key(entry)
+            if key in commented_keys:
+                skipped_duplicate += 1
+                continue
+            detail_payload: dict[str, Any] | None = None
+            try:
+                detail_payload = await self.controller.detail_feed(hostuin=entry.hostuin, fid=entry.fid, appid=entry.appid)
+                entry_data = detail_payload.get("entry")
+                if isinstance(entry_data, dict):
+                    detail_entry = FeedEntry(**entry_data)
+                    if detail_entry.fid == entry.fid and detail_entry.hostuin == entry.hostuin:
+                        entry = detail_entry
+            except Exception as exc:
+                skipped_detail += 1
+                logger.warning(
+                    "qzone scheduled comment skipped hostuin=%s fid=%s: detail check failed: %s",
+                    entry.hostuin,
+                    entry.fid,
+                    exc,
+                )
+                continue
+            post = post_from_entry(entry, detail=(detail_payload or {}).get("raw"), local_id=0)
+            if detail_payload and detail_payload.get("comments"):
+                post.comments = [
+                    QzoneComment(
+                        commentid=str(item.get("commentid") or ""),
+                        uin=int(item.get("uin") or 0),
+                        nickname=str(item.get("nickname") or ""),
+                        content=str(item.get("content") or ""),
+                    )
+                    for item in detail_payload.get("comments") or []
+                    if isinstance(item, dict)
+                ]
+            if login_uin and any(comment.uin == login_uin for comment in post.comments):
+                commented_keys.add(key)
+                self._save_auto_comment_keys(commented_keys)
+                skipped_duplicate += 1
+                continue
+            await self._post_store().upsert_async(post)
+            pipeline_result = await self._generate_auto_comment_pipeline(post)
+            if not pipeline_result.should_comment or not pipeline_result.comment_text.strip():
+                skipped_empty += 1
+                logger.info(
+                    "qzone scheduled comment skipped hostuin=%s fid=%s reason=%s",
+                    post.hostuin,
+                    post.fid,
+                    pipeline_result.skip_reason or "empty_comment",
+                )
+                continue
+            comment_text = pipeline_result.comment_text.strip()
+            await self._post_service().comment_post(post, comment_text)
+            commented_keys.add(key)
+            self._save_auto_comment_keys(commented_keys)
+            commented += 1
+            if getattr(self.settings, "like_when_comment", False):
+                try:
+                    await self._post_service().like_post(post)
+                except Exception as exc:
+                    logger.warning(
+                        "qzone scheduled comment like failed after comment hostuin=%s fid=%s: %s",
+                        post.hostuin,
+                        post.fid,
+                        exc,
+                    )
+            try:
+                await self._notify_admin_post_card(
+                    None,
+                    post,
+                    f"定时自动评论了 {self._post_display_nickname(post)} 的说说：{truncate(comment_text, 60)}",
+                    comment_text=comment_text,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "qzone scheduled comment admin notification failed hostuin=%s fid=%s: %s",
+                    post.hostuin,
+                    post.fid,
+                    exc,
+                )
+            logger.info(
+                "qzone scheduled comment posted hostuin=%s fid=%s count=%s/%s",
+                post.hostuin,
+                post.fid,
+                commented,
+                target_count,
+            )
+        if commented:
+            logger.info(
+                "qzone scheduled comment succeeded commented=%s skipped_self=%s skipped_duplicate=%s skipped_empty=%s skipped_detail=%s scanned=%s",
+                commented,
+                skipped_self,
+                skipped_duplicate,
+                skipped_empty,
+                skipped_detail,
+                len(entries),
+            )
+        else:
+            logger.info(
+                "qzone scheduled comment finished with no eligible posts skipped_self=%s skipped_duplicate=%s skipped_empty=%s skipped_detail=%s scanned=%s",
+                skipped_self,
+                skipped_duplicate,
+                skipped_empty,
+                skipped_detail,
+                len(entries),
+            )
+
+    def _get_cookie_lock(self) -> asyncio.Lock:
+        if self._cookie_lock is None:
+            self._cookie_lock = asyncio.Lock()
+        return self._cookie_lock
+
+    def _get_video_upload_lock(self) -> asyncio.Lock:
+        if getattr(self, "_video_upload_lock", None) is None:
+            self._video_upload_lock = asyncio.Lock()
+        return self._video_upload_lock
+
+    @staticmethod
+    def _looks_like_onebot_client(candidate: Any) -> bool:
+        if candidate is None:
+            return False
+        for action in (
+            *COOKIE_ACTIONS,
+            *ONEBOT_ACTION_CALLER_ATTRS,
+            "get_msg",
+            "get_file",
+            "get_record",
+            "get_image",
+            "get_group_file_url",
+            "get_private_file_url",
+            "get_file_url",
+            "get_video_url",
+            "get_stranger_info",
+            "get_group_member_info",
+        ):
+            if callable(getattr(candidate, action, None)):
+                return True
+        return False
+
+    @staticmethod
+    def _looks_like_onebot_sender(candidate: Any) -> bool:
+        if candidate is None:
+            return False
+        return any(
+            callable(getattr(candidate, action, None))
+            for action in ("send_group_msg", "send_private_msg", "send_msg")
+        )
+
+    @classmethod
+    def _extract_onebot_client(cls, owner: Any) -> Any | None:
+        """Find a usable OneBot/Aiocqhttp action client without caching wrappers.
+
+        AstrBot adapters expose several wrapper shapes. Some events have a
+        ``bot`` attribute that is only a wrapper; returning it blindly makes
+        ``/qzone autobind`` call get_cookies on the wrong object. Only return
+        objects that really expose OneBot action dispatchers, while walking the
+        common nested adapter/API fields used by aiocqhttp, NapCat, LLOneBot,
+        Lagrange, and AstrBot platform managers.
+        """
+
+        queue: list[Any] = [owner] if owner is not None else []
+        seen: set[int] = set()
+        owner_attrs = tuple(dict.fromkeys((*ONEBOT_ACTION_OWNER_ATTRS, "protocol_client", "driver", "impl")))
+        getter_names = ("get_client", "get_bot", "get_adapter", "get_platform")
+
+        index = 0
+        while index < len(queue) and index < 64:
+            current = queue[index]
+            index += 1
+            if current is None:
+                continue
+            current_id = id(current)
+            if current_id in seen:
+                continue
+            seen.add(current_id)
+
+            if cls._looks_like_onebot_client(current):
+                return current
+
+            for getter_name in getter_names:
+                try:
+                    getter = getattr(current, getter_name, None)
+                except Exception:
+                    getter = None
+                if not callable(getter):
+                    continue
+                try:
+                    candidate = getter()
+                except Exception:
+                    continue
+                if candidate is not None and id(candidate) not in seen:
+                    queue.append(candidate)
+
+            for attr in owner_attrs:
+                try:
+                    candidate = getattr(current, attr, None)
+                except Exception:
+                    continue
+                if candidate is not None and id(candidate) not in seen:
+                    queue.append(candidate)
+        return None
+
+    @classmethod
+    def _extract_onebot_sender(cls, owner: Any) -> Any | None:
+        queue: list[Any] = [owner] if owner is not None else []
+        seen: set[int] = set()
+        owner_attrs = tuple(dict.fromkeys((*ONEBOT_ACTION_OWNER_ATTRS, "protocol_client", "driver", "impl")))
+        index = 0
+        while index < len(queue) and index < 64:
+            current = queue[index]
+            index += 1
+            if current is None:
+                continue
+            current_id = id(current)
+            if current_id in seen:
+                continue
+            seen.add(current_id)
+            if cls._looks_like_onebot_sender(current) or cls._looks_like_onebot_client(current):
+                return current
+            for attr in owner_attrs:
+                try:
+                    candidate = getattr(current, attr, None)
+                except Exception:
+                    continue
+                if candidate is not None and id(candidate) not in seen:
+                    queue.append(candidate)
+        return None
+
+    @staticmethod
+    def _onebot_platform_meta_matches(candidate: Any) -> bool:
+        try:
+            meta_attr = getattr(candidate, "meta", None)
+            meta = meta_attr() if callable(meta_attr) else meta_attr
+        except Exception:
+            meta = None
+        values = [
+            getattr(candidate, "name", ""),
+            getattr(candidate, "type", ""),
+            getattr(candidate, "platform_type", ""),
+            getattr(candidate, "platform_name", ""),
+            getattr(meta, "name", ""),
+            getattr(meta, "type", ""),
+        ]
+        for value in values:
+            text = str(value or "").lower()
+            if (
+                text == "aiocqhttp"
+                or "onebot" in text
+                or "cqhttp" in text
+                or "napcat" in text
+                or "llbot" in text
+                or "llonebot" in text
+                or "lagrange" in text
+                or "shamrock" in text
+            ):
+                return True
+        return False
+
+    @classmethod
+    def _iter_context_platform_candidates(cls, context: Any) -> list[Any]:
+        if context is None:
+            return []
+        candidates: list[Any] = []
+        seen: set[int] = set()
+
+        def add(value: Any) -> None:
+            if value is None:
+                return
+            if isinstance(value, dict):
+                for item in value.values():
+                    add(item)
+                return
+            if isinstance(value, (list, tuple, set)):
+                for item in value:
+                    add(item)
+                return
+            value_id = id(value)
+            if value_id in seen:
+                return
+            seen.add(value_id)
+            candidates.append(value)
+
+        add(context)
+
+        try:
+            get_platform = getattr(context, "get_platform", None)
+        except Exception:
+            get_platform = None
+        if callable(get_platform):
+            for platform_type in (
+                "aiocqhttp",
+                "onebot",
+                "onebot11",
+                "onebot_v11",
+                "onebot_v12",
+                "go-cqhttp",
+                "gocqhttp",
+                "napcat",
+                "llbot",
+                "llonebot",
+                "lagrange",
+                "shamrock",
+            ):
+                try:
+                    add(get_platform(platform_type))
+                except Exception:
+                    pass
+
+        for attr in ("platform", "adapter", "bot"):
+            try:
+                add(getattr(context, attr, None))
+            except Exception:
+                pass
+
+        try:
+            platform_manager = getattr(context, "platform_manager", None)
+        except Exception:
+            platform_manager = None
+        if platform_manager is not None:
+            for attr in ("platform_insts", "platforms", "adapters", "instances"):
+                try:
+                    add(getattr(platform_manager, attr, None))
+                except Exception:
+                    pass
+            for getter_name in ("get_platforms", "get_all_platforms", "list_platforms"):
+                try:
+                    getter = getattr(platform_manager, getter_name, None)
+                except Exception:
+                    getter = None
+                if callable(getter):
+                    try:
+                        add(getter())
+                    except Exception:
+                        pass
+        return candidates
+
+    def _capture_onebot_client_from_context(self) -> Any | None:
+        context = getattr(self, "_context", None) or getattr(self, "context", None)
+        for candidate in self._iter_context_platform_candidates(context):
+            bot = self._extract_onebot_client(candidate)
+            if bot is not None:
+                self._onebot_client = bot
+                return bot
+            if self._onebot_platform_meta_matches(candidate):
+                logger.debug("qzone found OneBot-like AstrBot platform but no action client on it")
+        return getattr(self, "_onebot_client", None)
+
+    def _capture_onebot_client(self, event: AstrMessageEvent | None = None) -> Any | None:
+        if event is not None:
+            message_obj = getattr(event, "message_obj", None)
+            for owner in (
+                event,
+                message_obj,
+                getattr(event, "platform", None),
+                getattr(event, "platform_meta", None),
+                getattr(event, "adapter", None),
+            ):
+                bot = self._extract_onebot_client(owner)
+                if bot is not None:
+                    self._onebot_client = bot
+                    return bot
+        return self._capture_onebot_client_from_context()
+
+    def _capture_onebot_sender(self, event: AstrMessageEvent | None = None) -> Any | None:
+        if event is not None:
+            message_obj = getattr(event, "message_obj", None)
+            for owner in (
+                event,
+                message_obj,
+                getattr(event, "bot", None),
+                getattr(event, "platform", None),
+                getattr(event, "adapter", None),
+            ):
+                bot = self._extract_onebot_sender(owner)
+                if bot is not None:
+                    return bot
+        return self._capture_onebot_client_from_context()
+
+    def _cookie_binding_hint(self) -> str:
+        client = getattr(self, "_onebot_client", None)
+        if client is not None:
+            callers = iter_onebot_action_callers(client)
+            if callers:
+                return (
+                    "OneBot/Aiocqhttp action client was detected, but it did not return a usable Qzone Cookie; "
+                    "please confirm get_cookies/get_credentials is supported and the bot is logged in, or bind with /qzone bind."
+                )
+            return (
+                "The detected OneBot/Aiocqhttp object does not expose a callable action API; "
+                "please confirm the AstrBot aiocqhttp/NapCat/LLOneBot adapter is online, or bind with /qzone bind."
+            )
+        return (
+            "No usable OneBot/Aiocqhttp action client was found from AstrBot; "
+            "please confirm the protocol endpoint is connected, or bind with /qzone bind."
+        )
+
+    async def _auto_bind_cookie(
+        self,
+        event: AstrMessageEvent | None = None,
+        *,
+        force: bool = False,
+        source: str = "onebot",
+    ) -> dict[str, Any]:
+        async with self._get_cookie_lock():
+            if not self.settings.auto_bind_cookie and not force:
+                raise QzoneCookieAcquireError("自动绑定 Cookie 未开启")
+
+            bot = self._capture_onebot_client(event)
+            if bot is None:
+                raise QzoneCookieAcquireError(f"无法从 OneBot 获取 Cookie。{self._cookie_binding_hint()}")
+
+            try:
+                status = await self.controller.get_status(probe_daemon=False)
+            except QzoneBridgeError:
+                status = {}
+
+            if not force and status and int(status.get("cookie_count") or 0) > 0 and not bool(status.get("needs_rebind")):
+                return status
+
+            last_error: QzoneBridgeError | None = None
+            for attempt in range(1, AUTO_BIND_RETRY_ATTEMPTS + 1):
+                try:
+                    cookie_text = await fetch_cookie_text(bot, domain=self.settings.cookie_domain)
+                    if not cookie_text:
+                        raise QzoneCookieAcquireError(f"OneBot 没有返回可用 Cookie。{self._cookie_binding_hint()}")
+
+                    try:
+                        cookie_uin = normalize_uin(parse_cookie_text(cookie_text))
+                    except Exception:
+                        cookie_uin = 0
+                    payload = await self.controller.bind_cookie_local(cookie_text, uin=cookie_uin, source=source)
+                    if attempt > 1:
+                        logger.info("qzone auto bind succeeded on attempt %s/%s", attempt, AUTO_BIND_RETRY_ATTEMPTS)
+                    return payload
+                except QzoneBridgeError as exc:
+                    last_error = exc
+                except Exception as exc:
+                    last_error = QzoneCookieAcquireError(f"自动绑定 Cookie 失败：{exc}")
+
+                logger.warning(
+                    "qzone auto bind attempt %s/%s failed: %s",
+                    attempt,
+                    AUTO_BIND_RETRY_ATTEMPTS,
+                    last_error,
+                )
+                if attempt < AUTO_BIND_RETRY_ATTEMPTS:
+                    await asyncio.sleep(AUTO_BIND_RETRY_DELAY_SECONDS)
+
+            if last_error is not None:
+                raise last_error
+            raise QzoneCookieAcquireError(f"OneBot 没有返回可用 Cookie。{self._cookie_binding_hint()}")
+
+    async def _ensure_cookie_ready(
+        self,
+        event: AstrMessageEvent | None = None,
+        *,
+        force: bool = False,
+        source: str = "onebot",
+    ) -> dict[str, Any] | None:
+        try:
+            status = await self.controller.get_status(probe_daemon=False)
+        except QzoneBridgeError:
+            status = {}
+        if not force and status and int(status.get("cookie_count") or 0) > 0 and not bool(status.get("needs_rebind")):
+            self._schedule_publish_render_asset_preload("cookie ready", event=event, status=status)
+            return status
+        payload = await self._auto_bind_cookie(event, force=force, source=source)
+        self._schedule_publish_render_asset_preload("cookie bind", event=event, status=payload)
+        return payload
+
+    async def _ensure_cookie_ready_for_video_auth(self, event: AstrMessageEvent | None = None) -> dict[str, Any] | None:
+        """Ensure Web Cookie/p_skey is available for status diagnostics."""
+
+        try:
+            status = await self.controller.get_status(probe_daemon=False)
+        except QzoneBridgeError:
+            status = {}
+        if status and int(status.get("cookie_count") or 0) > 0 and not bool(status.get("needs_rebind")):
+            self._schedule_publish_render_asset_preload("video auth cookie ready", event=event, status=status)
+            return status
+        return await self._ensure_cookie_ready(event, force=True, source="onebot")
+
+    @staticmethod
+    def _status_has_video_publish_ready(status: dict[str, Any] | None) -> bool:
+        if not isinstance(status, dict):
+            return False
+        video_upload = status.get("video_upload")
+        if not isinstance(video_upload, dict):
+            return False
+        return bool(
+            video_upload.get("h5_publish_supported")
+            and (video_upload.get("web_cookie_configured") or video_upload.get("h5_upload_available"))
+        )
+
+    async def _call_bootstrap_auto_bind(
+        self,
+        trigger: str,
+        event: AstrMessageEvent | None = None,
+        *,
+        force_refresh: bool = False,
+    ) -> bool:
+        try:
+            signature = inspect.signature(self._bootstrap_auto_bind)
+            if "force_refresh" in signature.parameters:
+                return await self._bootstrap_auto_bind(trigger, event, force_refresh=force_refresh)
+        except (TypeError, ValueError):
+            pass
+        return await self._bootstrap_auto_bind(trigger, event)
+
+    async def _bootstrap_auto_bind(
+        self,
+        trigger: str,
+        event: AstrMessageEvent | None = None,
+        *,
+        force_refresh: bool = False,
+    ) -> bool:
+        client = self._capture_onebot_client(event) if event is not None else self._capture_onebot_client_from_context()
+        if client is None:
+            await self._prewarm_daemon_if_cookie_ready(trigger)
+            return False
+        if not self.settings.auto_bind_cookie:
+            await self._prewarm_daemon_if_cookie_ready(trigger)
+            return True
+        try:
+            await self._ensure_cookie_ready(event, force=force_refresh, source="onebot")
+        except QzoneBridgeError as exc:
+            logger.warning("qzone auto bind on %s failed: %s", trigger, exc)
+            return False
+        await self._prewarm_daemon_if_cookie_ready(trigger)
+        return True
+
+    def _schedule_bootstrap_auto_bind(
+        self,
+        trigger: str,
+        event: AstrMessageEvent | None = None,
+        *,
+        force_refresh: bool = False,
+    ) -> None:
+        task = getattr(self, "_auto_bind_bootstrap_task", None)
+        if task is not None and not task.done():
+            return
+        if bool(getattr(self, "_auto_bind_bootstrap_succeeded", False)) and not force_refresh:
+            return
+        if event is not None and self._capture_onebot_client(event) is None and self.settings.auto_bind_cookie:
+            return
+
+        async def runner() -> None:
+            try:
+                if await self._call_bootstrap_auto_bind(trigger, event, force_refresh=force_refresh):
+                    self._auto_bind_bootstrap_succeeded = True
+                    self._schedule_page_feed_preload(trigger)
+            except Exception:
+                logger.warning("qzone auto bind on %s failed unexpectedly", trigger, exc_info=True)
+
+        self._auto_bind_bootstrap_task = asyncio.create_task(runner())
+
+    def _schedule_page_preload(self, trigger: str) -> None:
+        task = getattr(self, "_page_preload_task", None)
+        if task is not None and not task.done():
+            return
+
+        async def runner() -> None:
+            try:
+                if not bool(getattr(self, "_auto_bind_bootstrap_succeeded", False)):
+                    if await self._call_bootstrap_auto_bind(trigger):
+                        self._auto_bind_bootstrap_succeeded = True
+                await self._prewarm_daemon_if_cookie_ready(trigger)
+            except Exception:
+                logger.debug("qzone page preload on %s failed", trigger, exc_info=True)
+
+        self._page_preload_task = asyncio.create_task(runner())
+
+    def _schedule_page_feed_preload(self, trigger: str) -> None:
+        if not bool(getattr(self.settings, "auto_start_daemon", True)):
+            return
+        if not hasattr(self, "controller"):
+            return
+        task = getattr(self, "_page_feed_preload_task", None)
+        if task is not None and not task.done():
+            return
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        if now - float(getattr(self, "_last_page_feed_preload_at", 0.0) or 0.0) < 45.0:
+            return
+        self._last_page_feed_preload_at = now
+
+        async def runner() -> None:
+            try:
+                status = await self.controller.get_status(probe_daemon=False)
+                if int(status.get("cookie_count") or 0) <= 0 or bool(status.get("needs_rebind")):
+                    return
+                await self.controller.ensure_running()
+                limit = min(max(5, int(getattr(self.settings, "max_feed_limit", 10) or 10)), 10)
+                await self.controller.list_feeds(hostuin=0, limit=limit, scope="active", record_recent=False)
+            except QzoneBridgeError as exc:
+                logger.debug("qzone page feed preload on %s failed: %s", trigger, exc)
+            except Exception:
+                logger.debug("qzone page feed preload on %s failed unexpectedly", trigger, exc_info=True)
+
+        self._page_feed_preload_task = asyncio.create_task(runner())
+
+    async def _prewarm_daemon_if_cookie_ready(self, trigger: str) -> None:
+        if not self.settings.auto_start_daemon:
+            return
+        try:
+            status = await self.controller.get_status(probe_daemon=False)
+        except QzoneBridgeError as exc:
+            logger.debug("qzone daemon prewarm status check on %s failed: %s", trigger, exc)
+            return
+        if int(status.get("cookie_count") or 0) <= 0 or bool(status.get("needs_rebind")):
+            return
+        self._schedule_publish_render_asset_preload("daemon prewarm", status=status)
+        self._schedule_daemon_warmup(trigger)
+
+    def _schedule_daemon_warmup(self, trigger: str) -> None:
+        if not self.settings.auto_start_daemon:
+            return
+        task = self._daemon_warmup_task
+        if task is not None and not task.done():
+            return
+
+        async def runner() -> None:
+            try:
+                await self.controller.ensure_running()
+            except QzoneBridgeError as exc:
+                logger.warning("qzone daemon prewarm on %s failed: %s", trigger, exc)
+            except Exception:
+                logger.warning("qzone daemon prewarm on %s failed unexpectedly", trigger, exc_info=True)
+
+        self._daemon_warmup_task = asyncio.create_task(runner())
+
+    async def initialize(self):
+        if self.settings.cookies_str:
+            try:
+                payload = await self.controller.bind_cookie_local(self.settings.cookies_str, source="config")
+                self._schedule_publish_render_asset_preload("config bind", status=payload)
+                self._schedule_daemon_warmup("config bind")
+            except QzoneBridgeError as exc:
+                logger.warning("qzone config cookie bind failed: %s", exc)
+        self._start_scheduled_tasks()
+        self._schedule_bootstrap_auto_bind("initialize", force_refresh=True)
+
+    @filter.command_group("qzone")
+    def qzone(self):
+        """QQ 空间管理命令组，可绑定 Cookie、查看状态和管理说说。"""
+        pass
+
+    @filter.command_group("新闻说说")
+    def news_feed(self):
+        """Google News RSS 新闻说说命令组。"""
+        pass
+
+    @filter.on_astrbot_loaded()
+    async def qzone_on_astrbot_loaded(self):
+        """AstrBot 加载完成后启动定时任务，并预热 Qzone Cookie。"""
+        self._start_scheduled_tasks()
+        self._schedule_bootstrap_auto_bind("astrbot load", force_refresh=True)
+
+    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
+    async def qzone_capture_aiocqhttp_client(self, event: AstrMessageEvent):
+        """捕获 OneBot 客户端，并按配置预热或自动读取 Qzone 说说。"""
+        self._capture_onebot_client(event)
+        should_auto_read = self.settings.read_prob > 0 and random.random() < self.settings.read_prob
+        force_cookie_refresh = bool(self.settings.auto_bind_cookie) and not bool(
+            getattr(self, "_auto_bind_bootstrap_succeeded", False)
+        )
+        if not should_auto_read:
+            self._schedule_bootstrap_auto_bind("aiocqhttp capture", event, force_refresh=force_cookie_refresh)
+            return
+        group_id = str(self._group_id(event) or "")
+        sender_id = str(self._sender_id(event) or "")
+        if group_id and group_id in self.settings.ignore_groups:
+            self._schedule_bootstrap_auto_bind("aiocqhttp capture", event, force_refresh=force_cookie_refresh)
+            return
+        if sender_id and sender_id in self.settings.ignore_users:
+            self._schedule_bootstrap_auto_bind("aiocqhttp capture", event, force_refresh=force_cookie_refresh)
+            return
+        try:
+            await self._ensure_cookie_ready(event, force=force_cookie_refresh)
+            if force_cookie_refresh:
+                self._auto_bind_bootstrap_succeeded = True
+            await self._ensure_daemon()
+            posts = await self._posts_for_event(
+                event,
+                ("看说说", "查看说说"),
+                target_id=int(sender_id or 0),
+                no_commented=True,
+                no_self=True,
+            )
+            if not posts:
+                return
+            post = posts[0]
+            content = await self._generate_comment_text(event, post)
+            if not content.strip():
+                return
+            await self._post_service().comment_post(post, content.strip())
+            if self.settings.like_when_comment:
+                await self._post_service().like_post(post)
+            comment_text = content.strip()
+            await self._notify_event_post_card(
+                event,
+                post,
+                f"已自动评论 {self._post_display_nickname(post)} 的说说：{truncate(comment_text, 60)}",
+                comment_text=comment_text,
+            )
+        except Exception as exc:
+            logger.debug("qzone probabilistic read/comment failed: %s", exc)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("查看访客")
+    async def view_visitor(self, event: AstrMessageEvent):
+        """查看当前 QQ 空间最近访客。"""
+        try:
+            await self._ensure_cookie_ready(event)
+            await self._ensure_daemon()
+            payload = await self.controller.view_visitors()
+        except QzoneBridgeError as exc:
+            yield self._command_result(event, self._error_text(exc))
+            return
+        yield await self._markdown_result(event, self._format_visitors(payload), subdir="visitors")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("看说说", alias={"查看说说"})
+    async def view_feed(self, event: AstrMessageEvent):
+        """查看好友或指定 QQ 的说说，并渲染成卡片。"""
+        if not self._is_admin(event):
+            yield self._command_result(event, "只有管理员可以查看说说。")
+            return
+        try:
+            await self._ensure_cookie_ready(event)
+            await self._ensure_daemon()
+            posts = await self._posts_for_event(event, ("看说说", "查看说说"), with_detail=True)
+        except QzoneBridgeError as exc:
+            yield self._command_result(event, self._error_text(exc))
+            return
+        async for result in self._yield_post_card_results(event, posts, self._format_posts(posts, detail=True)):
+            yield result
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("读说说")
+    async def read_feed(self, event: AstrMessageEvent):
+        """按序号读取说说详情，不自动评论或点赞。"""
+        if not self._is_admin(event):
+            yield self._command_result(event, "只有管理员可以查看说说。")
+            return
+        try:
+            await self._ensure_cookie_ready(event)
+            await self._ensure_daemon()
+            selection = self._selection_for_event(event, ("读说说",))
+            posts = await self._posts_for_selection(
+                selection,
+                with_detail=True,
+                no_commented=False,
+                no_self=False,
+                login_uin=self._self_id(event),
+            )
+        except QzoneBridgeError as exc:
+            yield self._command_result(event, self._error_text(exc))
+            return
+        async for result in self._yield_post_card_results(event, posts, self._format_posts(posts, detail=True)):
+            yield result
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("评说说", alias={"评论说说"})
+    async def comment_feed(self, event: AstrMessageEvent):
+        """给选中的说说发表评论，留空时由 AI 生成。"""
+        if not self._is_admin(event):
+            yield self._command_result(event, "只有管理员可以评论。")
+            return
+        try:
+            await self._ensure_cookie_ready(event)
+            await self._ensure_daemon()
+            selection = self._selection_for_event(event, ("评说说", "评论说说"))
+            use_safety_filters = not _selection_has_explicit_input(selection)
+            posts = await self._posts_for_selection(
+                selection,
+                with_detail=True,
+                no_commented=use_safety_filters,
+                no_self=use_safety_filters,
+                login_uin=self._self_id(event),
+            )
+            if not posts:
+                yield self._command_result(event, "没有找到可评论的说说。可以先用 看说说 1~3 确认编号或范围。")
+                return
+        except QzoneBridgeError as exc:
+            yield self._command_result(event, self._error_text(exc))
+            return
+
+        lines: list[str] = []
+        error_lines: list[str] = []
+        comment_texts: dict[int, str] = {}
+        commented_posts: list[QzonePost] = []
+        for post in posts:
+            content = selection.comment_text or await self._generate_comment_text(event, post)
+            if not content.strip():
+                content = "挺有意思的。"
+            try:
+                await self._post_service().comment_post(post, content)
+            except QzoneBridgeError as exc:
+                error_lines.append(f"第 {post.local_id} 条评论失败：{self._error_text(exc)}")
+                continue
+            if self.settings.like_when_comment:
+                try:
+                    await self._post_service().like_post(post)
+                except QzoneBridgeError as exc:
+                    error_lines.append(f"第 {post.local_id} 条已评论，但点赞失败：{self._error_text(exc)}")
+            comment_texts[id(post)] = content
+            commented_posts.append(post)
+            lines.append(f"已评论第 {post.local_id} 条：{truncate(content, 60)}")
+
+        async for result in self._yield_post_card_results(
+            event,
+            commented_posts,
+            self._format_posts(commented_posts, detail=True),
+            fallback_when_unrendered=False,
+            comment_texts=comment_texts,
+        ):
+            yield result
+        yield self._command_result(event, "\n".join([*lines, *error_lines]))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("赞说说")
+    async def like_feed(self, event: AstrMessageEvent):
+        """给选中的说说点赞。"""
+        if not self._is_admin(event):
+            yield self._command_result(event, "只有管理员可以点赞。")
+            return
+        try:
+            await self._ensure_cookie_ready(event)
+            await self._ensure_daemon()
+            posts = await self._posts_for_event(event, ("赞说说",), with_detail=True)
+            if not posts:
+                yield self._command_result(event, "没有找到可点赞的说说。")
+                return
+            lines: list[str] = []
+            for post in posts:
+                payload = await self._post_service().like_post(post)
+                lines.append(format_like_result(payload))
+        except QzoneBridgeError as exc:
+            yield self._command_result(event, self._error_text(exc))
+            return
+        yield self._command_result(event, "\n".join(lines))
+        async for result in self._yield_post_card_results(
+            event,
+            posts,
+            self._format_posts(posts, detail=True),
+            fallback_when_unrendered=False,
+        ):
+            yield result
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("发说说")
+    async def publish_feed(self, event: AstrMessageEvent, content: str = ""):
+        """发布一条 QQ 空间说说，支持文字和图片。"""
+        self._stop_event(event)
+        post = await self._collect_target_post_payload(event, content, ("发说说",))
+        profile_task: asyncio.Task | None = None
+        try:
+            await self._ensure_cookie_ready(event)
+            profile_task = self._schedule_publisher_profile(event)
+            post, payload = await self._publish_post_payload(post, event=event)
+            if payload.get("fid"):
+                await self._post_store().upsert_async(
+                    QzonePost(
+                        hostuin=self._self_id(event),
+                        fid=str(payload.get("fid") or ""),
+                        appid=311,
+                        summary=post.content,
+                        images=[str(item.source) for item in post.media],
+                    )
+                )
+        except QzoneBridgeError as exc:
+            if profile_task is not None:
+                profile_task.cancel()
+            yield self._command_result(event, self._error_text(exc))
+            return
+        yield await self._publish_result(event, post, payload, profile_task=profile_task)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("发日常说说")
+    async def publish_life_feed_auto(self, event: AstrMessageEvent):
+        """立即执行“日程上下文 -> LLM 自拍提示词 -> OmniDraw 自拍 -> QQ 空间发布”的完整链路。"""
+        self._stop_event(event)
+        try:
+            payload = await self._auto_life_publish_once(event, force_publish=True, notify_admin=False)
+        except QzoneBridgeError as exc:
+            yield self._command_result(event, self._error_text(exc))
+            return
+        except Exception as exc:
+            logger.warning("qzone manual life publish failed: %s", exc, exc_info=True)
+            yield self._command_result(event, f"日常说说发布失败：{exc}")
+            return
+        if not payload:
+            yield self._command_result(
+                event,
+                "日常说说发布已跳过：请检查 Life Scheduler、OmniDraw、LLM 配置，或将失败策略改为 text_only。",
+            )
+            return
+        post = getattr(payload, "post", None)
+        if not isinstance(post, PostPayload):
+            post = PostPayload(content="", media=[])
+        for result in await self._manual_publish_completion_results(event, post, payload, "日常说说发布完成"):
+            yield result
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("写说说", alias={"写稿"})
+    async def write_feed(self, event: AstrMessageEvent):
+        """根据主题生成说说草稿，提交管理员审核。"""
+        topic = self._message_after_command(self._event_text(event), ("写说说", "写稿"))
+        post = await self._collect_target_post_payload(event, topic, ("写说说", "写稿"))
+        try:
+            text = await self._generate_post_text(event, post.content)
+        except Exception as exc:
+            logger.warning("qzone write feed generation failed: %s", exc)
+            text = ""
+        post.content = text.strip() or post.content
+        if not post.content.strip() and not post.media:
+            yield self._command_result(event, "说说生成失败。")
+            return
+        draft = await self._create_draft(event, post, anonymous=False)
+        await self._notify_review_target(event, draft, "有一条 AI 写稿等待审核")
+        yield await self._markdown_result(event, f"已生成稿件 #{draft.id}，可用 过稿 {draft.id} 发布。", subdir="drafts")
+
+    async def _fetch_news_candidates_for_command(self, event: AstrMessageEvent, arg_text: str):
+        if not self._is_admin(event):
+            return self._command_result(event, "只有管理员可以获取新闻候选。")
+        default_limit = int(getattr(self.settings, "news_max_candidates", 12) or 12)
+        limit, scope_text = self._parse_news_fetch_args(arg_text, default_limit=default_limit)
+        try:
+            state = self._load_news_publish_state()
+            items = await self._news_candidates(
+                scope_override=scope_text,
+                seen_ids=self._news_published_ids(state),
+                limit=limit,
+            )
+            if not items:
+                return self._command_result(event, "没有获取到可用新闻。")
+            self._save_news_candidates_cache(items, scope_text=scope_text, requested_limit=limit)
+            return self._command_result(event, self._format_news_candidates(items))
+        except QzoneBridgeError as exc:
+            return self._command_result(event, self._error_text(exc))
+        except Exception as exc:
+            logger.warning("qzone news candidates fetch failed: %s", exc)
+            return self._command_result(event, "新闻候选获取失败。")
+
+    async def _preview_news_feed_for_command(self, event: AstrMessageEvent, arg_text: str):
+        if not self._is_admin(event):
+            return self._command_result(event, "只有管理员可以预览新闻说说。")
+        arg_text = str(arg_text or "").strip()
+        items: list[NewsItem] = []
+        cache_info: dict[str, Any] = {}
+        try:
+            if re.fullmatch(r"-?\d+", arg_text):
+                cached_items, cache_info = self._load_news_candidates_cache()
+                items = self._selected_news_items(cached_items, self._parse_news_selection(arg_text))
+                if not cached_items:
+                    return self._command_result(event, "还没有新闻候选缓存，请先执行：新闻说说 获取 10")
+                if not items:
+                    return self._command_result(event, f"新闻序号无效，当前可选范围是 1~{len(cached_items)}。")
+            else:
+                items = await self._news_candidates(scope_override=arg_text, seen_ids=set())
+                if not items:
+                    return self._command_result(event, "没有获取到可用新闻。")
+            text = await self._generate_original_news_post_text(event, items)
+        except QzoneBridgeError as exc:
+            return self._command_result(event, self._error_text(exc))
+        except Exception as exc:
+            logger.warning("qzone news preview failed: %s", exc)
+            return self._command_result(event, "新闻说说预览失败。")
+        if not text.strip():
+            return self._command_result(event, "新闻说说生成失败，可能是内容过于接近标题。")
+        summary = self._news_items_summary(items)
+        response = f"新闻说说预览：\n{text.strip()}"
+        if cache_info:
+            response = f"{response}\n\n来源：最近一次新闻候选缓存"
+        if summary:
+            response = f"{response}\n\n候选新闻：\n{summary}"
+        return self._command_result(event, response)
+
+    async def _publish_news_feed_for_command(self, event: AstrMessageEvent, arg_text: str):
+        if not self._is_admin(event):
+            return self._command_result(event, "只有管理员可以发布新闻说说。")
+        cached_items, _cache_info = self._load_news_candidates_cache()
+        if not cached_items:
+            return self._command_result(event, "还没有新闻候选缓存，请先执行：新闻说说 获取 10")
+        selection = self._parse_news_selection(arg_text)
+        items = self._selected_news_items(cached_items, selection)
+        if not items:
+            return self._command_result(event, f"新闻序号无效，当前可选范围是 1~{len(cached_items)}。")
+
+        profile_task: asyncio.Task | None = None
+        try:
+            text = await self._generate_original_news_post_text(event, items)
+            if not text.strip():
+                return self._command_result(event, "新闻说说生成失败，可能是内容过于接近标题。")
+            post = PostPayload(content=text.strip(), media=[])
+            await self._ensure_cookie_ready(event)
+            await self._ensure_daemon()
+            profile_task = self._schedule_publisher_profile(event)
+            payload = await self.controller.publish_post(content=post.content, content_sanitized=True)
+            if payload.get("fid"):
+                await self._post_store().upsert_async(
+                    QzonePost(
+                        hostuin=self._self_id(event),
+                        fid=str(payload.get("fid") or ""),
+                        appid=311,
+                        summary=post.content,
+                        images=[],
+                    )
+                )
+            state = self._load_news_publish_state()
+            self._record_news_publish(state, items=items, post=post, payload=payload)
+        except QzoneBridgeError as exc:
+            if profile_task is not None:
+                profile_task.cancel()
+            return self._command_result(event, self._error_text(exc))
+        except Exception as exc:
+            if profile_task is not None:
+                profile_task.cancel()
+            logger.warning("qzone news publish command failed: %s", exc)
+            return self._command_result(event, "新闻说说发布失败。")
+        return await self._publish_result(event, post, payload, profile_task=profile_task)
+
+    @news_feed.command("帮助")
+    async def news_feed_help(self, event: AstrMessageEvent):
+        """查看新闻说说命令组用法。"""
+        text = "\n".join(
+            [
+                "新闻说说命令",
+                "新闻说说 获取 [数量] [中国/国际/混合]：获取并缓存候选新闻，按发布时间排序。",
+                "新闻说说 预览 [序号/中国/国际/混合]：预览大模型生成的原创新闻说说，不发布。",
+                "新闻说说 发布 <序号>：选择缓存候选新闻，交给大模型生成原创说说并发布。",
+                "兼容命令：获取新闻、新闻列表、新闻说说预览、发布新闻说说。",
+            ]
+        )
+        yield self._command_result(event, text)
+
+    @news_feed.command("获取")
+    async def news_feed_fetch(self, event: AstrMessageEvent):
+        """获取并缓存 Google News RSS 候选新闻。"""
+        arg_text = self._message_after_command(self._event_text(event), ("新闻说说 获取", "新闻说说获取"))
+        yield await self._fetch_news_candidates_for_command(event, arg_text)
+
+    @news_feed.command("预览")
+    async def news_feed_preview(self, event: AstrMessageEvent):
+        """按缓存序号或范围预览新闻说说。"""
+        arg_text = self._message_after_command(self._event_text(event), ("新闻说说 预览", "新闻说说预览"))
+        yield await self._preview_news_feed_for_command(event, arg_text)
+
+    @news_feed.command("发布")
+    async def news_feed_publish(self, event: AstrMessageEvent):
+        """按缓存序号发布一条 LLM 原创新闻说说。"""
+        arg_text = self._message_after_command(self._event_text(event), ("新闻说说 发布", "新闻说说发布"))
+        yield await self._publish_news_feed_for_command(event, arg_text)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("获取新闻", alias={"新闻列表"})
+    async def fetch_news_feed(self, event: AstrMessageEvent):
+        """获取并缓存 Google News RSS 候选新闻。"""
+        arg_text = self._message_after_command(self._event_text(event), ("获取新闻", "新闻列表"))
+        yield await self._fetch_news_candidates_for_command(event, arg_text)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("发布新闻说说", alias={"发新闻说说"})
+    async def publish_selected_news_feed(self, event: AstrMessageEvent):
+        """按缓存序号发布一条 LLM 原创新闻说说。"""
+        arg_text = self._message_after_command(self._event_text(event), ("发布新闻说说", "发新闻说说"))
+        yield await self._publish_news_feed_for_command(event, arg_text)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("新闻说说预览")
+    async def preview_news_feed(self, event: AstrMessageEvent):
+        """Preview an original Qzone post generated from Google News RSS candidates."""
+
+        arg_text = self._message_after_command(self._event_text(event), ("新闻说说预览",))
+        yield await self._preview_news_feed_for_command(event, arg_text)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("删说说")
+    async def delete_feed(self, event: AstrMessageEvent):
+        """删除当前账号已发布的指定说说。"""
+        try:
+            await self._ensure_cookie_ready(event)
+            await self._ensure_daemon()
+            posts = await self._posts_for_event(
+                event,
+                ("删说说",),
+                target_id=self._self_id(event),
+            )
+            if not posts:
+                yield self._command_result(event, "没有找到可删除的说说。")
+                return
+            lines: list[str] = []
+            for post in posts:
+                payload = await self._post_service().delete_post(post)
+                lines.append(format_action_result("删除结果", payload))
+        except QzoneBridgeError as exc:
+            yield self._command_result(event, self._error_text(exc))
+            return
+        yield await self._markdown_result(event, "\n".join(lines), subdir="posts")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("回评", alias={"回复评论"})
+    async def reply_comment(self, event: AstrMessageEvent):
+        """回复指定已发布说说下的评论。"""
+        if not self._is_admin(event):
+            yield self._command_result(event, "只有管理员可以回评。")
+            return
+        raw = self._message_after_command(self._event_text(event), ("回评", "回复评论"))
+        parts = raw.split()
+        post_id = int(parts[0]) if parts and re.fullmatch(r"-?\d+", parts[0]) else 0
+        if post_id <= 0:
+            yield self._command_result(event, "请提供要回评的稿件ID，例如：回评 3。")
+            return
+        comment_position = 0
+        if len(parts) > 1:
+            if not re.fullmatch(r"\d+", parts[1]):
+                yield self._command_result(event, "评论序号需要是从 1 开始的数字。")
+                return
+            comment_position = int(parts[1])
+            if comment_position <= 0:
+                yield self._command_result(event, "评论序号需要从 1 开始。")
+                return
+        saved = await self._post_store().get_async(post_id)
+        draft = None if saved else await self.drafts.get_async(post_id)
+        if saved is None and (draft is None or not draft.published_fid):
+            yield self._command_result(event, f"稿件 #{post_id} 不存在或还没有发布。")
+            return
+        try:
+            await self._ensure_cookie_ready(event)
+            await self._ensure_daemon()
+            status = await self.controller.get_status(probe_daemon=False)
+            if saved is not None:
+                hostuin = saved.hostuin
+                fid = saved.fid
+                appid = saved.appid
+            else:
+                hostuin = int(status.get("login_uin") or self._self_id(event) or 0)
+                fid = draft.published_fid  # type: ignore[union-attr]
+                appid = 311
+            detail = await self.controller.detail_feed(hostuin=hostuin, fid=fid, appid=appid)
+            entry = FeedEntry(**detail["entry"])
+            post = post_from_entry(entry, detail=detail.get("raw"), local_id=post_id)
+            if detail.get("comments"):
+                post.comments = [
+                    QzoneComment(
+                        commentid=str(item.get("commentid") or ""),
+                        uin=int(item.get("uin") or 0),
+                        nickname=str(item.get("nickname") or ""),
+                        content=str(item.get("content") or ""),
+                    )
+                    for item in detail.get("comments") or []
+                    if isinstance(item, dict)
+                ]
+            await self._post_store().upsert_async(post)
+            login_uin = int(status.get("login_uin") or 0)
+            comments = [item for item in post.comments if not login_uin or item.uin != login_uin]
+            if not comments:
+                yield self._command_result(event, "这条说说暂时没有可回复的评论。")
+                return
+            if comment_position > len(comments):
+                yield self._command_result(event, f"这条说说只有 {len(comments)} 条可回复评论。")
+                return
+            comment = comments[comment_position - 1] if comment_position else comments[-1]
+            content = await self._generate_reply_text(event, post, comment)
+            if not content.strip():
+                content = "收到啦。"
+            payload = await self.controller.reply_comment(
+                hostuin=hostuin,
+                fid=fid,
+                commentid=comment.commentid,
+                comment_uin=comment.uin,
+                content=content.strip(),
+                appid=post.appid,
+            )
+        except QzoneBridgeError as exc:
+            yield self._command_result(event, self._error_text(exc))
+            return
+        yield await self._markdown_result(event, format_action_result("回复结果", payload), subdir="posts")
+
+    @filter.command("投稿")
+    async def contribute_post(self, event: AstrMessageEvent, content: str = ""):
+        """提交一条待审核的说说投稿。"""
+        post = await self._collect_target_post_payload(event, content, ("投稿",))
+        if not post.content.strip() and not post.media:
+            yield self._command_result(event, "投稿内容或图片不能为空。")
+            return
+        draft = await self._create_draft(event, post, anonymous=False)
+        await self._notify_review_target(event, draft, "收到一条投稿")
+        yield await self._markdown_result(event, f"投稿已收到，稿件编号 #{draft.id}。", subdir="drafts")
+
+    @filter.command("匿名投稿")
+    async def anon_contribute_post(self, event: AstrMessageEvent, content: str = ""):
+        """匿名提交一条待审核的说说投稿。"""
+        post = await self._collect_target_post_payload(event, content, ("匿名投稿",))
+        if not post.content.strip() and not post.media:
+            yield self._command_result(event, "投稿内容或图片不能为空。")
+            return
+        draft = await self._create_draft(event, post, anonymous=True)
+        await self._notify_review_target(event, draft, "收到一条匿名投稿")
+        yield await self._markdown_result(event, f"匿名投稿已收到，稿件编号 #{draft.id}。", subdir="drafts")
+
+    @filter.command("撤稿")
+    async def recall_post(self, event: AstrMessageEvent):
+        """撤回自己尚未审核的投稿。"""
+        draft_id, _ = self._draft_id_from_event(event, ("撤稿",))
+        if draft_id <= 0:
+            yield self._command_result(event, "请提供要撤回的稿件ID，例如：撤稿 3。")
+            return
+        sender_id = self._sender_id(event)
+        is_admin = self._is_admin(event)
+        draft = await self.drafts.get_async(draft_id)
+        if draft is None:
+            yield self._command_result(event, f"稿件 #{draft_id} 不存在。")
+            return
+        if draft.author_uin != sender_id and not is_admin:
+            yield self._command_result(event, "只能撤回自己的投稿。")
+            return
+        if draft.status != "pending":
+            yield self._command_result(event, f"稿件 #{draft.id} 当前是 {draft.status}，不能撤回。")
+            return
+        failure = ""
+
+        def recall(current: DraftPost) -> None:
+            nonlocal failure
+            if current.author_uin != sender_id and not is_admin:
+                failure = "permission"
+                return
+            if current.status != "pending":
+                failure = current.status
+                return
+            current.status = "recalled"
+
+        updated = await self.drafts.update_async(draft.id, recall)
+        if updated is None:
+            yield self._command_result(event, f"稿件 #{draft_id} 不存在。")
+            return
+        if failure == "permission":
+            yield self._command_result(event, "只能撤回自己的投稿。")
+            return
+        if failure:
+            yield self._command_result(event, f"稿件 #{updated.id} 当前是 {failure}，不能撤回。")
+            return
+        yield await self._markdown_result(event, f"稿件 #{updated.id} 已撤回。", subdir="drafts")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("看稿", alias={"查看稿件"})
+    async def view_post(self, event: AstrMessageEvent):
+        """查看待审核投稿列表或指定稿件。"""
+        draft_id, _ = self._draft_id_from_event(event, ("看稿", "查看稿件"))
+        if draft_id > 0:
+            draft = await self.drafts.get_async(draft_id)
+            text = draft.preview(include_private=True) if draft else f"稿件 #{draft_id} 不存在。"
+        else:
+            drafts = (await self.drafts.list_async(status="pending"))[-10:]
+            text = "\n\n".join(draft.preview(include_private=True) for draft in drafts) or "暂无待审核稿件。"
+        yield await self._markdown_result(event, text, subdir="drafts")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("过稿", alias={"通过稿件", "通过投稿"})
+    async def approve_post(self, event: AstrMessageEvent):
+        """通过投稿并发布到当前 QQ 空间。"""
+        draft_id, _ = self._draft_id_from_event(event, ("过稿", "通过稿件", "通过投稿"))
+        if draft_id <= 0:
+            yield self._command_result(event, "请提供要通过的稿件ID，例如：过稿 3。")
+            return
+        draft = await self.drafts.get_async(draft_id)
+        if draft is None:
+            yield self._command_result(event, f"稿件 #{draft_id} 不存在。")
+            return
+        if draft.status != "pending":
+            yield self._command_result(event, f"稿件 #{draft.id} 当前是 {draft.status}，不能过稿。")
+            return
+        failure = ""
+
+        def claim_approved(current: DraftPost) -> None:
+            nonlocal failure
+            if current.status != "pending":
+                failure = current.status
+                return
+            current.status = "approved"
+
+        claimed = await self.drafts.update_async(draft.id, claim_approved)
+        if claimed is None:
+            yield self._command_result(event, f"稿件 #{draft_id} 不存在。")
+            return
+        if failure:
+            yield self._command_result(event, f"稿件 #{claimed.id} 当前是 {failure}，不能过稿。")
+            return
+        draft = claimed
+        post = PostPayload(content=self._draft_publish_content(draft), media=normalize_media_list(draft.media))
+        profile_task: asyncio.Task | None = None
+        try:
+            await self._ensure_cookie_ready(event)
+            profile_task = self._schedule_publisher_profile(event)
+            post, payload = await self._publish_post_payload(post, event=event)
+            published_fid = str(payload.get("fid") or "")
+
+            def mark_published(current: DraftPost) -> None:
+                current.status = "published"
+                current.published_fid = published_fid
+
+            updated_draft = await self.drafts.update_async(draft.id, mark_published) or draft
+            if published_fid:
+                login_uin = 0
+                try:
+                    login_uin = int((await self.controller.get_status(probe_daemon=False)).get("login_uin") or 0)
+                except Exception:
+                    login_uin = self._self_id(event)
+                saved_post = QzonePost(
+                    hostuin=login_uin,
+                    fid=published_fid,
+                    appid=311,
+                    summary=post.content,
+                    nickname="",
+                    images=[str(item.source) for item in post.media],
+                )
+                await self._post_store().upsert_async(saved_post)
+            await self._notify_draft_author(event, updated_draft, f"你的投稿 #{updated_draft.id} 已通过并发布。")
+        except QzoneBridgeError as exc:
+            if profile_task is not None:
+                profile_task.cancel()
+
+            def rollback_approved(current: DraftPost) -> None:
+                if current.status == "approved":
+                    current.status = "pending"
+
+            await self.drafts.update_async(draft.id, rollback_approved)
+            yield self._command_result(event, self._error_text(exc))
+            return
+        yield await self._publish_result(event, post, payload, profile_task=profile_task)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("拒稿", alias={"拒绝稿件", "拒绝投稿"})
+    async def reject_post(self, event: AstrMessageEvent):
+        """拒绝投稿并记录原因。"""
+        draft_id, reason = self._draft_id_from_event(event, ("拒稿", "拒绝稿件", "拒绝投稿"))
+        if draft_id <= 0:
+            yield self._command_result(event, "请提供要拒绝的稿件ID，例如：拒稿 3 原因。")
+            return
+        draft = await self.drafts.get_async(draft_id)
+        if draft is None:
+            yield self._command_result(event, f"稿件 #{draft_id} 不存在。")
+            return
+        if draft.status != "pending":
+            yield self._command_result(event, f"稿件 #{draft.id} 当前是 {draft.status}，不能拒稿。")
+            return
+        failure = ""
+
+        def reject(current: DraftPost) -> None:
+            nonlocal failure
+            if current.status != "pending":
+                failure = current.status
+                return
+            current.status = "rejected"
+            current.reject_reason = reason or "未填写原因"
+
+        updated = await self.drafts.update_async(draft.id, reject)
+        if updated is None:
+            yield self._command_result(event, f"稿件 #{draft_id} 不存在。")
+            return
+        if failure:
+            yield self._command_result(event, f"稿件 #{updated.id} 当前是 {failure}，不能拒稿。")
+            return
+        await self._notify_draft_author(event, updated, f"你的投稿 #{updated.id} 未通过：{updated.reject_reason}")
+        yield await self._markdown_result(event, f"稿件 #{updated.id} 已拒绝。", subdir="drafts")
+
+    @qzone.command("help")
+    async def qzone_help(self, event: AstrMessageEvent):
+        """查看 QQ 空间 Ultra 的命令用法。"""
+        text = "\n".join(
+            [
+                "QQ 空间命令",
+                "序号从 1 开始；最新/0 表示最新一条，支持 1~3、@用户 2。",
+                "查看访客",
+                "看说说/查看说说 [@用户] [序号/范围]",
+                "读说说 [@用户] [序号/范围]",
+                "评说说/评论说说 [@用户] [序号/范围] [评论内容]",
+                "赞说说 [@用户] [序号/范围]",
+                "发说说 <内容> [图片]",
+                "写说说/写稿 <主题> [图片]",
+                "新闻说说 获取 [数量] [中国/国际/混合]",
+                "新闻说说 预览 [序号/中国/国际/混合]",
+                "新闻说说 发布 <序号>",
+                "删说说 <序号>",
+                "回评/回复评论 <稿件ID> [评论序号]",
+                "投稿 <内容> [图片]",
+                "匿名投稿 <内容> [图片]",
+                "撤稿 <稿件ID>",
+                "看稿/查看稿件 [稿件ID]",
+                "过稿/通过稿件/通过投稿 <稿件ID>",
+                "拒稿/拒绝稿件/拒绝投稿 <稿件ID> [原因]",
+                "",
+                "保留的管理命令:",
+                "/qzone status",
+                "/qzone bind <cookie>",
+                "/qzone autobind",
+                "/qzone autovideoauth",
+                "/qzone unbind",
+                "",
+                "LLM tools:",
+                "llm_view_feed",
+                "llm_publish_feed",
+                "qzone_get_status",
+                "qzone_list_feed",
+                "qzone_view_post",
+                "qzone_detail_feed",
+                "qzone_publish_post",
+                "qzone_comment_post",
+                "qzone_like_post",
+                "qzone_delete_post",
+            ]
+        )
+        yield self._command_result(event, text)
+
+    @qzone.command("status")
+    async def qzone_status(self, event: AstrMessageEvent):
+        """查看 Cookie、daemon 和 QQ 空间连接状态。"""
+        if not self._is_admin(event):
+            yield self._command_result(event, "只有管理员可以查看状态。")
+            return
+        try:
+            payload = await self._status_with_recovery()
+        except QzoneBridgeError as exc:
+            yield self._command_result(event, self._error_text(exc))
+            return
+        yield self._command_result(event, format_status(payload))
+
+    @qzone.command("bind")
+    async def qzone_bind(self, event: AstrMessageEvent, cookie: str):
+        """手动绑定 QQ 空间 Cookie。"""
+        if not self._is_admin(event):
+            yield self._command_result(event, "只有管理员可以绑定 Cookie。")
+            return
+        try:
+            payload = await self.controller.bind_cookie_local(cookie)
+        except QzoneBridgeError as exc:
+            logger.warning("qzone bind failed: %s", exc)
+            yield self._command_result(event, self._error_text(exc))
+            return
+        self._schedule_publish_render_asset_preload("manual bind", event=event, status=payload)
+        self._schedule_daemon_warmup("manual bind")
+        try:
+            payload = await self._status_with_recovery()
+        except QzoneBridgeError as exc:
+            logger.warning("qzone bind: status refresh after bind failed: %s", exc)
+            yield self._command_result(
+                event,
+                f"Cookie 已绑定，但状态刷新失败：{self._error_text(exc)}\n可稍后用 /qzone status 重新查询。",
+            )
+            return
+        yield self._command_result(event, format_status(payload))
+
+    @qzone.command("autobind")
+    async def qzone_autobind(self, event: AstrMessageEvent):
+        """从 OneBot 自动获取并刷新 QQ 空间 Cookie。"""
+        if not self._is_admin(event):
+            yield self._command_result(event, "只有管理员可以自动绑定 Cookie。")
+            return
+        try:
+            payload = await self._auto_bind_cookie(event, force=True, source="onebot")
+        except QzoneBridgeError as exc:
+            logger.warning("qzone autobind failed: %s", exc)
+            yield self._command_result(event, self._error_text(exc))
+            return
+        self._schedule_publish_render_asset_preload("autobind", event=event, status=payload)
+        self._schedule_daemon_warmup("autobind")
+        try:
+            payload = await self._status_with_recovery()
+        except QzoneBridgeError as exc:
+            logger.warning("qzone autobind: status refresh after bind failed: %s", exc)
+            yield self._command_result(
+                event,
+                f"Cookie 已绑定，但状态刷新失败：{self._error_text(exc)}\n可稍后用 /qzone status 重新查询。",
+            )
+            return
+        yield self._command_result(event, format_status(payload))
+
+    @qzone.command("videoauth")
+    async def qzone_videoauth(
+        self,
+        event: AstrMessageEvent,
+        login_data_b64: str = "",
+        login_key_b64: str = "",
+        token_type: int = 2,
+        token_appid: int = 0,
+        token_wt_appid: int = 0,
+    ):
+        """Deprecated compatibility command; A2/vLoginData is not used as a fallback."""
+        if not self._is_admin(event):
+            yield self._command_result(event, "Only admins can refresh video publish authorization.")
+            return
+        yield self._command_result(
+            event,
+            "Video publishing is fixed to the H5 chain: upload video/cover, create an only-self-visible video mood, "
+            "call the permission update API to make it public, then verify public feed/detail. "
+            "QQ upload A2/vLoginData fallback is disabled. Use /qzone autovideoauth to refresh Qzone Web Cookie/p_skey.",
+        )
+
+    @qzone.command("autovideoauth")
+    async def qzone_autovideoauth(self, event: AstrMessageEvent, probe_mode: str = ""):
+        """Ensure H5 video publish readiness through Qzone Web Cookie/p_skey."""
+        if not self._is_admin(event):
+            yield self._command_result(event, "Only admins can refresh video publish authorization.")
+            return
+        try:
+            await self._ensure_cookie_ready_for_video_auth(event)
+            payload = await self._status_with_recovery()
+        except QzoneBridgeError as exc:
+            logger.warning("qzone autovideoauth failed: %s", exc)
+            yield self._command_result(event, self._error_text(exc))
+            return
+        yield self._command_result(event, format_status(payload))
+
+    @qzone.command("unbind")
+    async def qzone_unbind(self, event: AstrMessageEvent):
+        """解绑当前保存的 QQ 空间 Cookie。"""
+        if not self._is_admin(event):
+            yield self._command_result(event, "只有管理员可以解绑。")
+            return
+        try:
+            payload = await self.controller.unbind_local()
+        except QzoneBridgeError as exc:
+            yield self._command_result(event, self._error_text(exc))
+            return
+        yield self._command_result(event, format_status(payload))
+
+    @qzone.command("feed")
+    async def qzone_feed(self, event: AstrMessageEvent, hostuin: int = 0, limit: int = 0, cursor: str = ""):
+        """列出 QQ 空间说说，支持目标 QQ、数量和游标。"""
+        if not self._is_admin(event):
+            yield self._command_result(event, "只有管理员可以查看说说。")
+            return
+        try:
+            await self._ensure_cookie_ready(event)
+            await self._ensure_daemon()
+            payload = await self.controller.list_feeds(
+                hostuin=hostuin,
+                limit=self._limit(limit),
+                cursor=cursor,
+            )
+        except QzoneBridgeError as exc:
+            yield self._command_result(event, self._error_text(exc))
+            return
+        entries = self._to_feed_entries(payload)
+        text = format_feed_list(entries, cursor=str(payload.get("cursor") or ""), has_more=bool(payload.get("has_more")))
+        posts = [post_from_entry(entry, local_id=index) for index, entry in enumerate(entries, 1)]
+        async for result in self._yield_post_card_results(event, posts, text):
+            yield result
+
+    @qzone.command("detail")
+    async def qzone_detail(self, event: AstrMessageEvent, hostuin: int, fid: str, appid: int = 311):
+        """查看指定说说详情和评论。"""
+        if not self._is_admin(event):
+            yield self._command_result(event, "只有管理员可以查看说说详情。")
+            return
+        try:
+            await self._ensure_cookie_ready(event)
+            await self._ensure_daemon()
+            payload = await self.controller.detail_feed(hostuin=hostuin, fid=fid, appid=appid)
+        except QzoneBridgeError as exc:
+            yield self._command_result(event, self._error_text(exc))
+            return
+        entry_data = payload.get("entry")
+        post = None
+        if isinstance(entry_data, dict):
+            entry = FeedEntry(**entry_data)
+            post = post_from_entry(entry, detail=payload.get("raw"), local_id=1)
+            if payload.get("comments"):
+                post.comments = [
+                    QzoneComment(
+                        commentid=str(item.get("commentid") or ""),
+                        uin=int(item.get("uin") or 0),
+                        nickname=str(item.get("nickname") or ""),
+                        content=str(item.get("content") or ""),
+                        created_at=int(item.get("created_at") or item.get("date") or 0),
+                        parent_id=str(item.get("parent_id") or ""),
+                    )
+                    for item in payload.get("comments") or []
+                    if isinstance(item, dict)
+                ]
+        if post is None:
+            yield self._command_result(event, self._render_detail(payload))
+            return
+        async for result in self._yield_post_card_results(event, [post], self._render_detail(payload)):
+            yield result
+
+    @qzone.command("post")
+    async def qzone_post(self, event: AstrMessageEvent, content: str = ""):
+        """通过 /qzone post 发布一条说说。"""
+        self._stop_event(event)
+        if not self._is_admin(event):
+            yield self._command_result(event, "只有管理员可以发说说。")
+            return
+        post = await self._collect_target_post_payload(
+            event,
+            content,
+            ("qzone post",),
+            include_event_text=True,
+        )
+        profile_task: asyncio.Task | None = None
+        try:
+            await self._ensure_cookie_ready(event)
+            profile_task = self._schedule_publisher_profile(event)
+            post, payload = await self._publish_post_payload(post, event=event)
+        except QzoneBridgeError as exc:
+            if profile_task is not None:
+                profile_task.cancel()
+            yield self._command_result(event, self._error_text(exc))
+            return
+        yield await self._publish_result(event, post, payload, profile_task=profile_task)
+
+    @qzone.command("comment")
+    async def qzone_comment(self, event: AstrMessageEvent, hostuin: int, fid: str, content: str):
+        """给指定 fid 的说说发表评论。"""
+        if not self._is_admin(event):
+            yield self._command_result(event, "只有管理员可以评论。")
+            return
+        try:
+            await self._ensure_cookie_ready(event)
+            await self._ensure_daemon()
+            post = await self._post_from_detail_target(hostuin, fid, 311)
+            payload = await self.controller.comment_post(hostuin=hostuin, fid=fid, content=content)
+        except QzoneBridgeError as exc:
+            yield self._command_result(event, self._error_text(exc))
+            return
+        yield self._command_result(event, format_action_result("评论结果", payload))
+        if post is not None:
+            async for result in self._yield_post_card_results(
+                event,
+                [post],
+                post.detail_text(1),
+                fallback_when_unrendered=False,
+                comment_texts={id(post): content},
+            ):
+                yield result
+
+    @qzone.command("like")
+    async def qzone_like(self, event: AstrMessageEvent, hostuin: int, fid: str, appid: int = 311, unlike: bool = False):
+        """给指定 fid 的说说点赞或取消点赞。"""
+        if not self._is_admin(event):
+            yield self._command_result(event, "只有管理员可以点赞。")
+            return
+        try:
+            await self._ensure_cookie_ready(event)
+            await self._ensure_daemon()
+            post = await self._post_from_detail_target(hostuin, fid, appid)
+            payload = await self.controller.like_post(hostuin=hostuin, fid=fid, appid=appid, unlike=unlike)
+        except QzoneBridgeError as exc:
+            yield self._command_result(event, self._error_text(exc))
+            return
+        yield self._command_result(event, format_like_result(payload))
+        if post is not None:
+            async for result in self._yield_post_card_results(
+                event,
+                [post],
+                post.detail_text(1),
+                fallback_when_unrendered=False,
+            ):
+                yield result
+
+    @filter.llm_tool()
+    async def llm_view_feed(
+        self,
+        event: AstrMessageEvent,
+        user_id: str | None = None,
+        pos: int = 0,
+        like: bool = False,
+        reply: bool = False,
+    ):
+        """旧版兼容工具：查看某位用户 QQ 空间的一条说说。
+
+        新流程中，点赞请优先使用 qzone_like_post；评论请优先使用 qzone_comment_post。
+        如果用户原话已经明确要评论或点赞，本兼容工具会直接完成对应动作。
+        """
+        wants_comment = bool(reply or self._event_text_has_comment_intent(event))
+        wants_like = bool(like or self._event_text_has_like_intent(event))
+        if not self._is_admin(event):
+            payload = {
+                "ok": False,
+                "tool": "qzone_comment_post" if wants_comment else "qzone_like_post",
+                "public_reason": "没有权限",
+            }
+            self._log_tool_call_result({**payload, "arguments": {"user_id": user_id, "pos": pos}})
+            return await self._ask_llm_tool_reply(
+                event,
+                payload,
+                self._llm_error_fallback_text("没有权限"),
+            )
+        try:
+            await self._ensure_cookie_ready(event)
+            await self._ensure_daemon()
+            hostuin = self._tool_target_uin(event, user_id, fallback=self._sender_id(event))
+            selection = PostSelection(
+                target_uin=hostuin,
+                start=(pos + 1 if pos >= 0 else -1),
+                end=(pos + 1 if pos >= 0 else -1),
+                selector="index" if pos >= 0 else "last",
+            )
+            posts = await self._posts_for_selection(selection, with_detail=True, login_uin=self._self_id(event))
+            if not posts:
+                return "查询结果为空。"
+            post = posts[0]
+            results: list[dict[str, Any]] = []
+            if wants_comment:
+                results.extend(
+                    await self._comment_posts_for_tool(
+                        event,
+                        [post],
+                        auto_generate=True,
+                        private=False,
+                        like_after_comment=wants_like,
+                    )
+                )
+            elif wants_like:
+                result = await self._post_service().like_post(post)
+                results.append({"action": "like", "result": result})
+            if results:
+                tool = "qzone_comment_post" if wants_comment else "qzone_like_post"
+                payload = {
+                    "ok": True,
+                    "tool": tool,
+                    "result": {
+                        "message": "评论发好了。" if wants_comment else "点赞点好了。",
+                        "summary": truncate(post.summary or "", 80),
+                        "count": len(results),
+                    },
+                }
+                self._log_tool_call_result({**payload, "arguments": {"user_id": user_id, "pos": pos}})
+                return await self._ask_llm_tool_reply(
+                    event,
+                    payload,
+                    "评论好了。" if wants_comment else "点好了。",
+                )
+            fallback = post.detail_text(post.local_id)
+            return await self._ask_llm_view_reply(event, [post], detail=True, fallback=fallback)
+        except Exception as exc:
+            logger.warning("llm_view_feed failed: %s", exc)
+            if isinstance(exc, QzoneBridgeError):
+                payload = self._llm_error_payload("llm_view_feed", exc)
+                fallback = self._llm_error_fallback_text(exc.message)
+            else:
+                payload = {"ok": False, "public_reason": _public_error_reason(str(exc))}
+                fallback = self._llm_error_fallback_text(str(exc))
+            return await self._ask_llm_tool_reply(event, payload, fallback)
+
+    @filter.llm_tool()
+    async def llm_publish_feed(
+        self,
+        event: AstrMessageEvent,
+        text: str = "",
+        get_image: bool = True,
+    ):
+        """发布一条 QQ 空间说说。"""
+        if not self._is_admin(event):
+            return await self._ask_llm_tool_reply(
+                event,
+                {"ok": False, "tool": "qzone_publish_post", "public_reason": "没有权限"},
+                self._llm_error_fallback_text("没有权限"),
+            )
+        post = await self._collect_target_post_payload(
+            event,
+            text,
+            ("发说说", "qzone post"),
+            include_event_text=bool(get_image),
+        )
+        if not get_image:
+            post.media = []
+        try:
+            await self._ensure_cookie_ready(event)
+            await self._ensure_daemon()
+            post, payload = await self._publish_post_payload(post, event=event)
+        except QzoneBridgeError as exc:
+            llm_payload = self._llm_error_payload("qzone_publish_post", exc)
+            return await self._ask_llm_tool_reply(
+                event,
+                llm_payload,
+                self._llm_error_fallback_text(exc.message),
+            )
+        log_payload = {
+            "ok": True,
+            "tool": "qzone_publish_post",
+            "arguments": {"text": truncate(post.content, 120), "media_count": len(post.media)},
+            "result": payload,
+        }
+        self._log_tool_call_result(log_payload)
+        return await self._ask_llm_tool_reply(
+            event,
+            {
+                "ok": True,
+                "tool": "qzone_publish_post",
+                "result": {"message": "说说发好了。", "summary": truncate(post.content, 80)},
+            },
+            "发好了。",
+        )
+
+    @filter.llm_tool(name="qzone_get_status")
+    async def tool_get_status(self, event: AstrMessageEvent):
+        """获取 QQ 空间 daemon 状态。
+
+        Returns:
+            当前状态摘要。
+        """
+        if not self._is_admin(event):
+            return "只有管理员可以查看 QQ 空间状态。"
+        try:
+            payload = await self._status_with_recovery()
+        except QzoneBridgeError as exc:
+            return self._error_text(exc)
+        return format_status(payload)
+
+    @filter.llm_tool(name="qzone_list_feed")
+    async def tool_list_feed(
+        self,
+        event: AstrMessageEvent,
+        target_uin: int = 0,
+        limit: int = 5,
+        cursor: str = "",
+        scope: str = "auto",
+        hostuin: int = 0,
+    ):
+        """获取 QQ 空间说说列表。
+
+        Args:
+            target_uin (number): 目标 QQ 号，0 表示当前登录账号或好友动态流。
+            limit (number): 返回数量。
+            cursor (string): 翻页游标。
+            scope (string): auto/self/profile。
+            hostuin (number): 兼容旧参数，优先级低于 target_uin。
+        """
+        if not self._is_admin(event):
+            return await self._ask_llm_tool_reply(
+                event,
+                {"ok": False, "tool": "qzone_list_feed", "public_reason": "没有权限"},
+                self._llm_error_fallback_text("没有权限"),
+            )
+        try:
+            await self._ensure_cookie_ready(event)
+            await self._ensure_daemon()
+            effective_hostuin = self._tool_target_uin(event, target_uin, hostuin)
+            effective_scope = "" if scope == "auto" else scope
+            payload = await self.controller.list_feeds(
+                hostuin=effective_hostuin,
+                limit=self._limit(limit),
+                cursor=cursor,
+                scope=effective_scope,
+            )
+        except QzoneBridgeError as exc:
+            return self._error_text(exc)
+        entries = self._to_feed_entries(payload)
+        return format_llm_feed_list(entries)
+
+    @filter.llm_tool(name="qzone_detail_feed")
+    async def tool_detail_feed(self, event: AstrMessageEvent, hostuin: int, fid: str, appid: int = 311):
+        """获取说说详情。
+
+        Args:
+            hostuin (number): 目标 QQ 号。
+            fid (string): 说说 fid。
+            appid (number): 应用 id，默认 311。
+        """
+        if not self._is_admin(event):
+            return await self._ask_llm_tool_reply(
+                event,
+                {"ok": False, "tool": "qzone_detail_feed", "public_reason": "没有权限"},
+                self._llm_error_fallback_text("没有权限"),
+            )
+        try:
+            await self._ensure_cookie_ready(event)
+            await self._ensure_daemon()
+            payload = await self.controller.detail_feed(hostuin=hostuin, fid=fid, appid=appid)
+        except QzoneBridgeError as exc:
+            return self._error_text(exc)
+        return self._render_detail(payload)
+
+    @filter.llm_tool(name="qzone_view_post")
+    async def tool_view_post(
+        self,
+        event: AstrMessageEvent,
+        target_uin: int = 0,
+        selector: str = "latest",
+        detail: bool = True,
+        hostuin: int = 0,
+        fid: str = "",
+        appid: int = 311,
+    ):
+        """按自然选择器查看一条或多条 QQ 空间说说。
+
+        Args:
+            target_uin (number): 目标 QQ 号，0 表示当前登录账号或好友动态流。
+            selector (string): latest、最新、第2条、2、1~3 或 fid。
+            detail (boolean): 是否获取评论等详情。
+            hostuin (number): 兼容旧参数。
+            fid (string): 兼容旧参数。
+            appid (number): 兼容旧参数。
+        """
+        if not self._is_admin(event):
+            return await self._ask_llm_tool_reply(
+                event,
+                {"ok": False, "tool": "qzone_view_post", "public_reason": "没有权限"},
+                self._llm_error_fallback_text("没有权限"),
+            )
+        try:
+            await self._ensure_cookie_ready(event)
+            await self._ensure_daemon()
+            selection = self._selection_from_tool_args(
+                event,
+                target_uin=target_uin,
+                selector=selector,
+                hostuin=hostuin,
+                fid=fid,
+                appid=appid,
+            )
+            posts = await self._posts_for_selection(selection, with_detail=detail, login_uin=self._self_id(event))
+            wants_comment = self._event_text_has_comment_intent(event)
+            wants_like = self._event_text_has_like_intent(event)
+            if wants_comment or wants_like:
+                if not self._is_admin(event):
+                    payload = {
+                        "ok": False,
+                        "tool": "qzone_comment_post" if wants_comment else "qzone_like_post",
+                        "public_reason": "没有权限",
+                    }
+                    text = await self._ask_llm_tool_reply(
+                        event,
+                        payload,
+                        self._llm_error_fallback_text("没有权限"),
+                    )
+                    return text
+                if not posts:
+                    raise QzoneBridgeError("没有找到可操作的说说")
+                if wants_comment:
+                    if not detail:
+                        posts = await self._posts_for_selection(selection, with_detail=True, login_uin=self._self_id(event))
+                    results = await self._comment_posts_for_tool(
+                        event,
+                        posts,
+                        auto_generate=True,
+                        private=False,
+                        like_after_comment=wants_like,
+                    )
+                    payload = {
+                        "ok": True,
+                        "tool": "qzone_comment_post",
+                        "result": {"message": "评论发好了。", "count": len(results)},
+                    }
+                    self._log_tool_call_result({**payload, "arguments": {"target_uin": selection.target_uin, "selector": selector}})
+                    text = await self._ask_llm_tool_reply(event, payload, "评论发好了。")
+                    return text
+                like_payloads = [await self._post_service().like_post(post) for post in posts]
+                payload = {
+                    "ok": True,
+                    "tool": "qzone_like_post",
+                    "result": (
+                        like_payloads[0]
+                        if len(like_payloads) == 1
+                        else {"message": f"{len(like_payloads)} 条说说点好了。", "count": len(like_payloads)}
+                    ),
+                }
+                self._log_tool_call_result({**payload, "arguments": {"target_uin": selection.target_uin, "selector": selector}})
+                text = await self._ask_llm_tool_reply(event, self._llm_like_payload(payload["result"]), "点好了。")
+                return text
+        except QzoneBridgeError as exc:
+            text = await self._ask_llm_tool_reply(
+                event,
+                self._llm_error_payload("qzone_view_post", exc),
+                self._llm_error_fallback_text(exc.message),
+            )
+            return text
+        fallback = self._format_posts(posts, detail=detail)
+        text = await self._ask_llm_view_reply(event, posts, detail=detail, fallback=fallback)
+        return text
+
+    @filter.llm_tool(name="qzone_publish_post")
+    async def tool_publish_post(
+        self,
+        event: AstrMessageEvent,
+        content: str,
+        sync_weibo: bool = False,
+        media: list[str] | None = None,
+    ):
+        """发布 QQ 空间说说。
+
+        Args:
+            content (string): 说说内容。
+            sync_weibo (boolean): 是否同步到微博。
+        """
+        if not self._is_admin(event):
+            text = await self._ask_llm_tool_reply(
+                event,
+                {"ok": False, "tool": "qzone_publish_post", "public_reason": "没有权限"},
+                self._llm_error_fallback_text("没有权限"),
+            )
+            return text
+        post = await self._collect_target_post_payload(
+            event,
+            content,
+            ("qzone post",),
+            include_event_text=False,
+            extra_media=media,
+        )
+        try:
+            await self._ensure_cookie_ready(event)
+            post, payload = await self._publish_post_payload(post, sync_weibo=sync_weibo, event=event)
+        except QzoneBridgeError as exc:
+            text = await self._ask_llm_tool_reply(
+                event,
+                self._llm_error_payload("qzone_publish_post", exc),
+                self._llm_error_fallback_text(exc.message),
+            )
+            return text
+        log_payload = {
+            "ok": True,
+            "tool": "qzone_publish_post",
+            "arguments": {"content": truncate(post.content, 120), "media_count": len(post.media)},
+            "result": payload,
+        }
+        self._log_tool_call_result(log_payload)
+        text = await self._ask_llm_tool_reply(
+            event,
+            {
+                "ok": True,
+                "tool": "qzone_publish_post",
+                "result": {"message": "说说发好了。", "summary": truncate(post.content, 80)},
+            },
+            "发好了。",
+        )
+        return text
+
+    @filter.llm_tool(name="qzone_comment_post")
+    async def tool_comment_post(
+        self,
+        event: AstrMessageEvent,
+        target_uin: int = 0,
+        selector: str = "latest",
+        content: str = "",
+        auto_generate: bool = True,
+        private: bool = False,
+        like_after_comment: bool = False,
+        hostuin: int = 0,
+        fid: str = "",
+        appid: int = 311,
+        latest: bool = False,
+        index: int = 0,
+    ):
+        """按自然选择器评论一条说说。
+
+        Args:
+            target_uin (number): 目标 QQ 号，0 表示当前登录账号或好友动态流。
+            selector (string): latest、最新、第2条、2、1~3 或 fid。
+            content (string): 评论内容，留空时可由 LLM 生成。
+            auto_generate (boolean): content 为空时是否自动生成评论。
+            private (boolean): 是否私密评论。
+            like_after_comment (boolean): 评论后是否顺手点赞。
+            hostuin (number): 兼容旧参数，目标 QQ 号。
+            fid (string): 兼容旧参数，说说 fid。
+            appid (number): 兼容旧参数，说说 appid，默认 311。
+            latest (boolean): 兼容旧参数，为 true 时操作最新一条说说。
+            index (number): 兼容旧参数，操作最近列表第 N 条。
+        """
+        arguments = {
+            "target_uin": target_uin,
+            "selector": selector,
+            "content": content,
+            "auto_generate": auto_generate,
+            "private": private,
+            "like_after_comment": like_after_comment,
+            "hostuin": hostuin,
+            "fid": fid,
+            "appid": appid,
+            "latest": latest,
+            "index": index,
+        }
+        if not self._is_admin(event):
+            payload = {"ok": False, "tool": "qzone_comment_post", "public_reason": "没有权限"}
+            self._log_tool_call_result({**payload, "arguments": arguments})
+            text = await self._ask_llm_tool_reply(
+                event,
+                payload,
+                self._llm_error_fallback_text("没有权限"),
+            )
+            return text
+        try:
+            await self._ensure_cookie_ready(event)
+            await self._ensure_daemon()
+            selection = self._selection_from_tool_args(
+                event,
+                target_uin=target_uin,
+                selector=selector,
+                hostuin=hostuin,
+                fid=fid,
+                appid=appid,
+                latest=latest,
+                index=index,
+            )
+            posts = await self._posts_for_selection(
+                selection,
+                with_detail=auto_generate and not content.strip(),
+                login_uin=self._self_id(event),
+            )
+            results = await self._comment_posts_for_tool(
+                event,
+                posts,
+                content=content,
+                auto_generate=auto_generate,
+                private=private,
+                like_after_comment=like_after_comment,
+            )
+        except QzoneBridgeError as exc:
+            log_payload = self._bridge_error_log_payload("qzone_comment_post", exc, arguments)
+            self._log_tool_call_result(log_payload)
+            text = await self._ask_llm_tool_reply(
+                event,
+                self._llm_error_payload("qzone_comment_post", exc),
+                self._llm_error_fallback_text(exc.message),
+            )
+            return text
+        log_payload = {"ok": True, "tool": "qzone_comment_post", "arguments": arguments, "result": results}
+        self._log_tool_call_result(log_payload)
+        text = await self._ask_llm_tool_reply(
+            event,
+            {"ok": True, "tool": "qzone_comment_post", "result": {"message": "评论发好了。", "count": len(results)}},
+            "评论发好了。",
+        )
+        return text
+
+    @filter.llm_tool(name="qzone_delete_post")
+    async def tool_delete_post(
+        self,
+        event: AstrMessageEvent,
+        target_uin: int = 0,
+        selector: str = "latest",
+        hostuin: int = 0,
+        fid: str = "",
+        appid: int = 311,
+        latest: bool = False,
+        index: int = 0,
+    ):
+        """删除当前登录 QQ 空间的一条或多条说说。
+
+        Args:
+            target_uin (number): 兼容参数；删除只允许当前登录账号自己的说说。
+            selector (string): latest、最新、第2条、1~3 或 fid。
+            hostuin (number): 兼容旧参数；删除只允许当前登录账号自己的说说。
+            fid (string): 兼容旧参数，说说 fid。
+            appid (number): 说说 appid，默认 311。
+            latest (boolean): 为 true 时删除最新一条说说。
+            index (number): 删除最近列表第 N 条，1 表示第一条。
+        """
+        arguments = {
+            "target_uin": target_uin,
+            "selector": selector,
+            "hostuin": hostuin,
+            "fid": fid,
+            "appid": appid,
+            "latest": latest,
+            "index": index,
+        }
+        if not self._is_admin(event):
+            payload = {"ok": False, "tool": "qzone_delete_post", "public_reason": "没有权限"}
+            self._log_tool_call_result({**payload, "arguments": arguments})
+            text = await self._ask_llm_tool_reply(
+                event,
+                payload,
+                self._llm_error_fallback_text("没有权限"),
+            )
+            return text
+        try:
+            await self._ensure_cookie_ready(event)
+            await self._ensure_daemon()
+            status = await self.controller.get_status(probe_daemon=False)
+            login_uin = int(status.get("login_uin") or self._self_id(event) or 0)
+            requested_target = int(target_uin or hostuin or 0)
+            if requested_target and login_uin and requested_target != login_uin:
+                raise QzoneBridgeError("只能删除当前登录账号自己的说说")
+
+            selection = selection_from_tool_args(
+                target_uin=login_uin or requested_target,
+                selector=selector,
+                hostuin=0,
+                fid=fid,
+                appid=appid,
+                latest=latest,
+                index=index,
+            )
+            results: list[dict[str, Any]] = []
+            if selection.is_fid and not selection.target_uin:
+                result = await self.controller.delete_post(fid=selection.fid, appid=selection.appid)
+                results.append({"post": {"summary": ""}, "result": result})
+            else:
+                posts = await self._posts_for_selection(selection, login_uin=login_uin)
+                if not posts:
+                    raise QzoneBridgeError("没有找到可删除的说说")
+                for post in posts:
+                    result = await self._post_service().delete_post(post)
+                    results.append({"post": QzonePostService.post_payload(post), "result": result})
+        except QzoneBridgeError as exc:
+            log_payload = self._bridge_error_log_payload("qzone_delete_post", exc, arguments)
+            self._log_tool_call_result(log_payload)
+            text = await self._ask_llm_tool_reply(
+                event,
+                self._llm_error_payload("qzone_delete_post", exc),
+                self._llm_error_fallback_text(exc.message),
+            )
+            return text
+
+        count = len(results)
+        first_post = results[0].get("post") if results else {}
+        summary = truncate(str(first_post.get("summary") or "").strip(), 80) if isinstance(first_post, dict) else ""
+        message = f"{count} 条说说删好了。" if count != 1 else "说说删好了。"
+        llm_payload = {"ok": True, "tool": "qzone_delete_post", "result": {"message": message, "count": count}}
+        if summary:
+            llm_payload["result"]["summary"] = summary
+        self._log_tool_call_result(
+            {
+                "ok": True,
+                "tool": "qzone_delete_post",
+                "arguments": arguments,
+                "result": results,
+            }
+        )
+        text = await self._ask_llm_tool_reply(
+            event,
+            llm_payload,
+            f"「{summary}」删好了。" if summary else "删好了。",
+        )
+        return text
+
+    @filter.llm_tool(name="qzone_like_post")
+    async def tool_like_post(
+        self,
+        event: AstrMessageEvent,
+        target_uin: int = 0,
+        selector: str = "latest",
+        hostuin: int = 0,
+        fid: str = "",
+        appid: int = 311,
+        unlike: bool = False,
+        latest: bool = False,
+        index: int = 0,
+    ):
+        """点赞或取消点赞一条说说。
+
+        Args:
+            target_uin (number): 目标 QQ 号，`0` 表示当前登录账号或好友动态流。
+            selector (string): latest、最新、第2条、2、1~3 或 fid。
+            hostuin (number): 兼容旧参数，目标 QQ 号。
+            fid (string): 兼容旧参数，说说 fid，也可以用最近列表的序号。
+            appid (number): 说说 appid，默认 `311`。
+            unlike (boolean): 为 `true` 时取消点赞。
+            latest (boolean): 为 `true` 时操作最新一条说说。
+            index (number): 操作最近列表第 N 条，`1` 表示第一条。
+        """
+        arguments = {
+            "target_uin": target_uin,
+            "selector": selector,
+            "hostuin": hostuin,
+            "fid": fid,
+            "appid": appid,
+            "unlike": unlike,
+            "latest": latest,
+            "index": index,
+        }
+        if not self._is_admin(event):
+            log_payload = {
+                "ok": False,
+                "tool": "qzone_like_post",
+                "error": {
+                    "type": "PermissionError",
+                    "code": "QZONE_PERMISSION",
+                    "message": "没有权限",
+                },
+            }
+            self._log_tool_call_result({**log_payload, "arguments": arguments})
+            llm_payload = {
+                "ok": False,
+                "public_reason": "没有权限",
+                "reply_guidance": "Use a short natural reply in the active persona. Do not expose error details.",
+            }
+            text = await self._ask_llm_tool_reply(
+                event,
+                llm_payload,
+                self._llm_error_fallback_text("没有权限"),
+            )
+            return text
+        try:
+            await self._ensure_cookie_ready(event)
+            await self._ensure_daemon()
+            legacy_direct = bool(fid or latest or index)
+            if legacy_direct:
+                effective_hostuin = self._tool_target_uin(event, hostuin, target_uin)
+                payload = await self.controller.like_post(
+                    hostuin=effective_hostuin,
+                    fid=fid,
+                    appid=appid,
+                    unlike=unlike,
+                    latest=latest,
+                    index=index,
+                )
+            else:
+                selection = self._selection_from_tool_args(
+                    event,
+                    target_uin=target_uin,
+                    selector=selector,
+                    hostuin=hostuin,
+                    appid=appid,
+                )
+                posts = await self._posts_for_selection(selection, login_uin=self._self_id(event))
+                if not posts:
+                    raise QzoneBridgeError("没有找到可点赞的说说")
+                payloads = [await self._post_service().like_post(post, unlike=unlike) for post in posts]
+                payload = payloads[0] if len(payloads) == 1 else {
+                    "action": "unlike" if unlike else "like",
+                    "liked": not unlike,
+                    "verified": all(item.get("verified", True) is not False for item in payloads),
+                    "summary": f"{len(payloads)} 条说说",
+                    "items": payloads,
+                }
+        except QzoneBridgeError as exc:
+            log_payload = self._bridge_error_log_payload("qzone_like_post", exc, arguments)
+            self._log_tool_call_result(log_payload)
+            llm_payload = self._llm_error_payload("qzone_like_post", exc)
+            text = await self._ask_llm_tool_reply(
+                event,
+                llm_payload,
+                self._llm_error_fallback_text(exc.message),
+            )
+            return text
+        self._log_tool_call_result(
+            {
+                "ok": True,
+                "tool": "qzone_like_post",
+                "arguments": arguments,
+                "result": payload,
+            }
+        )
+        text = await self._ask_llm_tool_reply(
+            event,
+            self._llm_like_payload(payload),
+            self._like_fallback_text(payload),
+        )
+        return text
+
+    async def terminate(self):
+        for task in self._scheduled_tasks:
+            task.cancel()
+        if self._scheduled_tasks:
+            await asyncio.gather(*self._scheduled_tasks, return_exceptions=True)
+            self._scheduled_tasks.clear()
+        if self._publisher_profile_preload_task is not None:
+            self._publisher_profile_preload_task.cancel()
+            await asyncio.gather(self._publisher_profile_preload_task, return_exceptions=True)
+            self._publisher_profile_preload_task = None
+        if self._daemon_warmup_task is not None:
+            self._daemon_warmup_task.cancel()
+            await asyncio.gather(self._daemon_warmup_task, return_exceptions=True)
+            self._daemon_warmup_task = None
+        if self._auto_bind_bootstrap_task is not None:
+            self._auto_bind_bootstrap_task.cancel()
+            await asyncio.gather(self._auto_bind_bootstrap_task, return_exceptions=True)
+            self._auto_bind_bootstrap_task = None
+        page_preload_task = getattr(self, "_page_preload_task", None)
+        if page_preload_task is not None:
+            page_preload_task.cancel()
+            await asyncio.gather(page_preload_task, return_exceptions=True)
+            self._page_preload_task = None
+        page_feed_preload_task = getattr(self, "_page_feed_preload_task", None)
+        if page_feed_preload_task is not None:
+            page_feed_preload_task.cancel()
+            await asyncio.gather(page_feed_preload_task, return_exceptions=True)
+            self._page_feed_preload_task = None
+        try:
+            await self.controller.close()
+        except Exception as exc:
+            logger.exception("qzone controller close failed: %s", exc)

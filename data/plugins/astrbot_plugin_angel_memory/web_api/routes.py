@@ -1,0 +1,106 @@
+"""
+路由注册入口
+
+将所有 WebUI API 路由注册到 AstrBot context。
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from astrbot.api.star import Context
+
+PLUGIN_NAME = "astrbot_plugin_angel_memory"
+
+
+def register_all_routes(context: "Context", plugin_context, plugin=None) -> None:
+    """注册所有 WebUI API 路由。"""
+    from .memory_api import MemoryAPI
+    from .notes_api import NotesAPI
+    from .tags_api import TagsAPI
+    from .maintenance_api import MaintenanceAPI
+    from .profile_api import ProfileAPI
+    from .group_knowledge_api import GroupKnowledgeAPI
+
+    memory_api = MemoryAPI(plugin_context)
+    notes_api = NotesAPI(plugin_context)
+    tags_api = TagsAPI(plugin_context)
+    maintenance_api = MaintenanceAPI(plugin_context)
+    profile_api = ProfileAPI(plugin_context)
+    group_knowledge_api = GroupKnowledgeAPI(plugin_context, plugin)
+    from .debug_api import DebugAPI
+
+    debug_api = DebugAPI(plugin_context)
+    # 反思与睡眠记录
+    from .trace_api import TraceAPI
+
+    trace_api = TraceAPI(plugin_context)
+
+    # 工具测试（只读探针）
+    from .tool_test_api import ToolTestAPI
+
+    tool_test_api = ToolTestAPI(plugin_context)
+
+    routes = [
+        # 总览
+        (f"/{PLUGIN_NAME}/overview", memory_api.get_overview, ["GET"], "记忆系统总览"),
+        # 记忆
+        (f"/{PLUGIN_NAME}/memories", memory_api.browse_memories, ["GET"], "浏览记忆"),
+        (f"/{PLUGIN_NAME}/memories/delete", memory_api.delete_memory, ["POST"], "删除记忆"),
+        # 标签
+        (f"/{PLUGIN_NAME}/tags", tags_api.get_tags, ["GET"], "全局标签列表"),
+        (f"/{PLUGIN_NAME}/tags/hit-search", tags_api.hit_search, ["POST"], "标签命中搜索"),
+        # 笔记
+        (f"/{PLUGIN_NAME}/notes", notes_api.browse_notes, ["GET"], "笔记索引浏览"),
+        (f"/{PLUGIN_NAME}/notes/recall", notes_api.recall_note, ["POST"], "笔记内容读取"),
+        (f"/{PLUGIN_NAME}/notes/files", notes_api.list_note_files, ["GET"], "笔记文件列表"),
+        (f"/{PLUGIN_NAME}/notes/file-content", notes_api.get_file_content, ["GET"], "笔记文件内容"),
+        (f"/{PLUGIN_NAME}/notes/search-chunks", notes_api.search_chunks, ["GET"], "笔记切片搜索"),
+        (f"/{PLUGIN_NAME}/notes/chunk-stats", notes_api.chunk_stats, ["GET"], "笔记切片统计"),
+        # 导入导出
+        (f"/{PLUGIN_NAME}/export", maintenance_api.export_snapshot, ["GET"], "导出快照"),
+        (f"/{PLUGIN_NAME}/import", maintenance_api.import_snapshot, ["POST"], "导入快照"),
+        # 维护
+        (f"/{PLUGIN_NAME}/maintenance", maintenance_api.get_maintenance_state, ["GET"], "维护状态"),
+        (f"/{PLUGIN_NAME}/maintenance/download-backup", maintenance_api.download_backup, ["GET"], "下载备份"),
+        # 用户画像
+        (f"/{PLUGIN_NAME}/profiles", profile_api.list_users, ["GET"], "用户画像列表"),
+        (f"/{PLUGIN_NAME}/profiles/detail", profile_api.get_user_profile, ["GET"], "用户画像详情"),
+        # 群聊知识库可见性
+        (f"/{PLUGIN_NAME}/group-knowledge", group_knowledge_api.get_groups, ["GET"], "群聊知识库三态表"),
+        (f"/{PLUGIN_NAME}/group-knowledge/save", group_knowledge_api.save_groups, ["POST"], "保存群聊知识库三态表"),
+        # 功能调试（探针）
+        (f"/{PLUGIN_NAME}/debug/embedding", debug_api.embedding_probe, ["POST"], "嵌入探针（自定义批次/超时）"),
+        (f"/{PLUGIN_NAME}/debug/rerank", debug_api.rerank_probe, ["POST"], "重排探针（自定义超时）"),
+        # 反思与睡眠记录
+        (f"/{PLUGIN_NAME}/trace/reflection", trace_api.get_records, ["GET"], "反思与睡眠过程记录（最近20次）"),
+        (f"/{PLUGIN_NAME}/trace/delete", trace_api.delete_records, ["POST"], "删除指定的过程记录"),
+        # 工具测试（只读，两条链路各自独立触发）
+        (f"/{PLUGIN_NAME}/tool-test/auto-rag", tool_test_api.auto_rag, ["POST"], "自动RAG：注入给模型的上下文原文"),
+        (f"/{PLUGIN_NAME}/tool-test/active-recall", tool_test_api.active_recall, ["POST"], "主动搜索：angel_recall 工具原文"),
+    ]
+
+    if plugin is not None:
+        from .plugin_config_api import PluginConfigAPI
+
+        plugin_config_api = PluginConfigAPI(plugin_context, plugin)
+        routes.append(
+            (
+                f"/{PLUGIN_NAME}/plugin_config",
+                plugin_config_api.get_config,
+                ["GET"],
+                "插件全局配置（schema + 当前值 + provider 列表）",
+            )
+        )
+        routes.append(
+            (
+                f"/{PLUGIN_NAME}/plugin_config/save",
+                plugin_config_api.save_config,
+                ["POST"],
+                "保存插件全局配置并即时生效",
+            )
+        )
+
+    for path, handler, methods, description in routes:
+        context.register_web_api(path, handler, methods, description)

@@ -1,0 +1,31 @@
+{
+  "personas_dir": {
+    "description": "人设文件目录",
+    "type": "string",
+    "default": "",
+    "hint": "留空则使用插件自带 personas/ 目录；可以指向任意磁盘目录，例如 E:/AstrBot/personas"
+  },
+  "default_persona": {
+    "description": "默认人设文件名（不含 .md）",
+    "type": "string",
+    "default": "xiaojingyu"
+  },
+  "inject_position": {
+    "description": "注入位置",
+    "type": "string",
+    "options": ["prepend", "append"],
+    "labels": ["系统提示开头（推荐）", "系统提示结尾"],
+    "default": "prepend"
+  },
+  "max_history": {
+    "description": "每个人设保留的历史快照数量",
+    "type": "int",
+    "default": 50,
+    "slider": {"min": 5, "max": 200, "step": 5}
+  },
+  "enabled": {
+    "description": "总开关",
+    "type": "bool",
+    "default": true
+  }
+}

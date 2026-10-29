@@ -1,0 +1,11 @@
+{
+  "inject": {"type": "bool", "default": true, "description": "按话题自动注入记忆星图"},
+  "top_k": {"type": "int", "default": 3, "description": "每次最多注入几条记忆"},
+  "position": {"type": "string", "default": "append", "description": "prepend 或 append"},
+  "embedding_mode": {"type": "string", "default": "fastembed", "description": "local=本地词形；fastembed=本地语义模型；api=外部 OpenAI 兼容 embedding"},
+  "semantic_weight": {"type": "float", "default": 0.8, "description": "语义相似度权重 0.3-0.95，其余给关键词"},
+  "fastembed_model": {"type": "string", "default": "BAAI/bge-small-zh-v1.5", "description": "fastembed 模型名"},
+  "embedding_base": {"type": "string", "default": "", "description": "embedding 接口地址，例如 https://api.siliconflow.cn/v1"},
+  "embedding_key": {"type": "string", "default": "", "description": "embedding 接口 Key"},
+  "embedding_model": {"type": "string", "default": "", "description": "embedding 模型名，例如 BAAI/bge-m3"}
+}

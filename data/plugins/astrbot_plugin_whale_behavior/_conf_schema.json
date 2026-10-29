@@ -1,0 +1,540 @@
+{
+  "group_overrides_enabled": {
+    "description": "允许群级覆盖",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后可用 /whale set 给单个群单独调档，存 groups.json"
+  },
+  "enabled": {
+    "description": "总开关",
+    "type": "bool",
+    "default": true
+  },
+  "tier_slider": {
+    "description": "触发档位（0=只回@，100=每条都接）",
+    "type": "int",
+    "default": 60,
+    "slider": {
+      "min": 0,
+      "max": 100,
+      "step": 5
+    },
+    "hint": "群里没 @ 机器人时，按这个概率决定要不要插嘴；被 @ 或命中关键词不受影响"
+  },
+  "keywords": {
+    "description": "强制触发关键词",
+    "type": "list",
+    "default": [
+      "小鲸鱼",
+      "鲸鱼",
+      "deepseek",
+      "deepseek娘",
+      "小鲸鱼娘"
+    ]
+  },
+  "cooldown_sec": {
+    "description": "同群冷却时间（秒）",
+    "type": "int",
+    "default": 30
+  },
+  "burst_enabled": {
+    "description": "连发合并",
+    "type": "bool",
+    "default": true,
+    "hint": "同一个人连发几条时，等他停手再一起回复，而不是每条都抢答"
+  },
+  "burst_window_ms": {
+    "description": "连发静默窗口（毫秒）",
+    "type": "int",
+    "default": 1500,
+    "slider": {
+      "min": 300,
+      "max": 5000,
+      "step": 100
+    }
+  },
+  "burst_max_age_ms": {
+    "description": "最多合并多久以内的消息（毫秒）",
+    "type": "int",
+    "default": 8000
+  },
+  "split_enabled": {
+    "description": "启用分句发送",
+    "type": "bool",
+    "default": true
+  },
+  "split_marker": {
+    "description": "分句标记",
+    "type": "string",
+    "default": "||"
+  },
+  "split_by_newline": {
+    "description": "没有标记时按换行分句",
+    "type": "bool",
+    "default": false
+  },
+  "max_segments": {
+    "description": "单次最多拆几条",
+    "type": "int",
+    "default": 4,
+    "slider": {
+      "min": 1,
+      "max": 8,
+      "step": 1
+    }
+  },
+  "first_delay_ms": {
+    "description": "第一条消息前的延迟（毫秒）",
+    "type": "int",
+    "default": 300
+  },
+  "segment_delay_ms": {
+    "description": "分句之间的间隔（毫秒）",
+    "type": "int",
+    "default": 900
+  },
+  "skip_probability": {
+    "description": "潜水概率（%）",
+    "type": "int",
+    "default": 0,
+    "slider": {
+      "min": 0,
+      "max": 100,
+      "step": 5
+    },
+    "hint": "被触发后仍选择不回的概率，制造「看心情」的随机感"
+  },
+  "jitter_ms": {
+    "description": "分句间隔抖动（毫秒）",
+    "type": "int",
+    "default": 0,
+    "slider": {
+      "min": 0,
+      "max": 2000,
+      "step": 100
+    }
+  },
+  "sanitize": {
+    "description": "去 AI 味（清 markdown/列表符号）",
+    "type": "bool",
+    "default": true
+  },
+  "poke_enabled": {
+    "description": "允许戳一戳",
+    "type": "bool",
+    "default": true,
+    "hint": "模型输出 [poke] 时戳一下发言者（需要 OneBot 协议端支持 send_poke）"
+  },
+  "silence_token": {
+    "description": "静默标记",
+    "type": "string",
+    "default": "[SILENT]"
+  },
+  "quote_rate": {
+    "description": "引用原消息的概率（%）",
+    "type": "int",
+    "default": 15,
+    "slider": {
+      "min": 0,
+      "max": 100,
+      "step": 5
+    }
+  },
+  "at_rate": {
+    "description": "@ 发言者的概率（%）",
+    "type": "int",
+    "default": 0,
+    "slider": {
+      "min": 0,
+      "max": 100,
+      "step": 5
+    }
+  },
+  "group_reply_disabled": {
+    "description": "不回复群聊消息",
+    "type": "bool",
+    "default": false,
+    "hint": "打开后群里完全静默（连 @ 也不回），私聊不受影响"
+  },
+  "context_gate_enabled": {
+    "description": "智能判断是否接话（语境/情绪）",
+    "type": "bool",
+    "default": false,
+    "hint": "触发后额外调用一次小模型判断气氛和情绪，不合适就沉默；只影响概率/关键词触发，被 @ 仍会回复；会增加少量 token 消耗"
+  },
+  "context_gate_max_recent": {
+    "description": "语境判断参考最近几条消息",
+    "type": "int",
+    "default": 8,
+    "slider": {
+      "min": 3,
+      "max": 20,
+      "step": 1
+    }
+  },
+  "proactive_enabled": {
+    "description": "主动找人聊天",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后在没有消息时也会按间隔主动找人说话，需要先选生效对象"
+  },
+  "proactive_targets": {
+    "description": "主动聊天对象",
+    "type": "list",
+    "default": [],
+    "hint": "格式：private:QQ 或 group:群号"
+  },
+  "proactive_topic_mode": {
+    "description": "话题来源",
+    "type": "string",
+    "default": "mix",
+    "hint": "history=接着旧话题，share=分享相关领域，mix=随机混合"
+  },
+  "proactive_min_interval_min": {
+    "description": "最短间隔（分钟）",
+    "type": "int",
+    "default": 90,
+    "slider": {
+      "min": 10,
+      "max": 720,
+      "step": 10
+    }
+  },
+  "proactive_max_interval_min": {
+    "description": "最长间隔（分钟）",
+    "type": "int",
+    "default": 240,
+    "slider": {
+      "min": 10,
+      "max": 1440,
+      "step": 10
+    }
+  },
+  "proactive_daily_limit": {
+    "description": "每个对象每天最多几条",
+    "type": "int",
+    "default": 6,
+    "slider": {
+      "min": 1,
+      "max": 30,
+      "step": 1
+    }
+  },
+  "proactive_active_hours": {
+    "description": "活跃时段",
+    "type": "string",
+    "default": "09:00-23:30",
+    "hint": "支持逗号分隔多段，如 09:00-12:00,14:00-23:30"
+  },
+  "sleep_enabled": {
+    "type": "bool",
+    "default": true,
+    "description": "启用作息（睡觉时间不主动接话）"
+  },
+  "sleep_start": {
+    "type": "string",
+    "default": "23:30",
+    "description": "睡觉开始时间 HH:MM"
+  },
+  "sleep_end": {
+    "type": "string",
+    "default": "08:00",
+    "description": "起床时间 HH:MM"
+  },
+  "daily_mood_enabled": {
+    "type": "bool",
+    "default": true,
+    "description": "启用每日小状态（心情/精力）"
+  },
+  "late_ack_enabled": {
+    "type": "bool",
+    "default": true,
+    "description": "启用「刚看到」迟到回应"
+  },
+  "late_ack_gap_sec": {
+    "type": "int",
+    "default": 600,
+    "description": "超过多少秒没理再回时补一句"
+  },
+  "late_ack_probability": {
+    "type": "int",
+    "default": 45,
+    "description": "迟到回应触发概率（%）"
+  },
+  "relationship_enabled": {
+    "type": "bool",
+    "default": true,
+    "description": "启用关系阶段（亲密度影响语气和称呼）"
+  },
+  "promise_enabled": {
+    "type": "bool",
+    "default": true,
+    "description": "主动消息里提起未完成的约定"
+  },
+  "recall_enabled": {
+    "type": "bool",
+    "default": true,
+    "description": "偶尔发错一条再撤回"
+  },
+  "recall_probability": {
+    "type": "int",
+    "default": 8,
+    "description": "撤回小动作概率（%）"
+  },
+  "recall_delay_sec": {
+    "type": "int",
+    "default": 1,
+    "description": "发错到撤回的延迟（秒）"
+  },
+  "recall_cooldown_sec": {
+    "type": "int",
+    "default": 600,
+    "description": "撤回小动作冷却（秒）"
+  },
+  "poke_rate": {
+    "type": "int",
+    "default": 5,
+    "description": "回复后拍一拍的概率（%）"
+  },
+  "poke_cooldown_sec": {
+    "type": "int",
+    "default": 300,
+    "description": "拍一拍冷却（秒）"
+  },
+  "relationship_daily_gain_cap": {
+    "type": "int",
+    "default": 30,
+    "description": "每天亲密度最多涨多少（防刷）"
+  },
+  "anniversary_enabled": {
+    "type": "bool",
+    "default": true,
+    "description": "纪念日/生日主动祝福"
+  },
+  "anniversaries": {
+    "type": "text",
+    "default": "",
+    "description": "每行一条 MM-DD:内容",
+    "editor_mode": true
+  },
+  "anniversary_hour": {
+    "type": "int",
+    "default": 9,
+    "description": "几点后发祝福"
+  },
+  "weather_enabled": {
+    "type": "bool",
+    "default": false,
+    "description": "每天分享天气"
+  },
+  "weather_city": {
+    "type": "string",
+    "default": "Hangzhou",
+    "description": "城市（英文或拼音更稳）"
+  },
+  "weather_hour": {
+    "type": "int",
+    "default": 8,
+    "description": "几点后发天气"
+  },
+  "image_enabled": {
+    "type": "bool",
+    "default": false,
+    "description": "偶尔发一张图片"
+  },
+  "image_rate": {
+    "type": "int",
+    "default": 10,
+    "description": "发图概率（%）"
+  },
+  "image_cooldown_sec": {
+    "type": "int",
+    "default": 1800,
+    "description": "发图冷却（秒）"
+  },
+  "image_dir": {
+    "type": "string",
+    "default": "images",
+    "description": "图片目录（插件目录下）"
+  },
+  "weather_interval_min": {
+    "type": "int",
+    "default": 30,
+    "description": "多久检查一次天气（分钟）"
+  },
+  "weather_temp_drop": {
+    "type": "int",
+    "default": 4,
+    "description": "降温多少度提醒"
+  },
+  "weather_hot_temp": {
+    "type": "int",
+    "default": 33,
+    "description": "高于多少度提醒多喝水"
+  },
+  "weather_cold_temp": {
+    "type": "int",
+    "default": 6,
+    "description": "低于多少度提醒保暖"
+  },
+  "weather_alert_cooldown_sec": {
+    "type": "int",
+    "default": 21600,
+    "description": "同类天气提醒冷却（秒）"
+  },
+  "weather_key": {
+    "type": "string",
+    "default": "",
+    "description": "和风天气 API Key"
+  },
+  "weather_host": {
+    "type": "string",
+    "default": "",
+    "description": "和风天气 API Host（xxxx.re.qweatherapi.com）"
+  },
+  "weather_location": {
+    "type": "string",
+    "default": "",
+    "description": "精确到区县的地点，如 浙江省杭州市余杭区"
+  },
+  "signature_enabled": {
+    "type": "bool",
+    "default": false,
+    "description": "让 AI 按心情/聊天自动改 QQ 个性签名"
+  },
+  "signature_interval_hours": {
+    "type": "int",
+    "default": 12,
+    "description": "多久换一次签名（小时）"
+  },
+  "qzone_post_enabled": {
+    "type": "bool",
+    "default": true,
+    "description": "启用在 QQ 空间偶尔分享"
+  },
+  "qzone_chat_post_enabled": {
+    "type": "bool",
+    "default": true,
+    "description": "聊天后由 AI 判断是否值得发"
+  },
+  "qzone_chat_post_delay_min": {
+    "type": "int",
+    "default": 12,
+    "description": "聊天后多久再发（分钟）"
+  },
+  "qzone_chat_post_daily_cap": {
+    "type": "int",
+    "default": 1,
+    "description": "聊天触发的每天最多几条"
+  },
+  "qzone_weekly_enabled": {
+    "type": "bool",
+    "default": true,
+    "description": "每周随机几天分享日常"
+  },
+  "qzone_weekly_days_min": {
+    "type": "int",
+    "default": 3,
+    "description": "每周最少几天"
+  },
+  "qzone_weekly_days_max": {
+    "type": "int",
+    "default": 4,
+    "description": "每周最多几天"
+  },
+  "qzone_post_window_start": {
+    "type": "string",
+    "default": "12:00",
+    "description": "分享时段开始"
+  },
+  "qzone_post_window_end": {
+    "type": "string",
+    "default": "22:00",
+    "description": "分享时段结束"
+  },
+  "state_note_dedupe": {
+    "type": "bool",
+    "default": true,
+    "description": "动态状态/关系提示只在内容变化时注入（省 token）"
+  },
+  "life_profile": {
+    "type": "string",
+    "default": "上班族，工作日白天上班，晚上和周末自由安排",
+    "description": "角色日常设定：身份/工作/作息，用于生成每天的生活时间线"
+  },
+  "life_timeline_enabled": {
+    "type": "bool",
+    "default": true,
+    "description": "每天生成生活时间线，并在对话里注入当前时间状态"
+  },
+  "proactive_silence_min": {
+    "type": "int",
+    "default": 25,
+    "description": "沉默触发：对方多久没说话才允许主动"
+  },
+  "proactive_max_unanswered": {
+    "type": "int",
+    "default": 4,
+    "description": "最多主动多少次没回复就暂停"
+  },
+  "proactive_split_enabled": {
+    "type": "bool",
+    "default": true,
+    "description": "主动消息分段发送"
+  },
+  "proactive_split_max": {
+    "type": "int",
+    "default": 3,
+    "description": "最多分几段"
+  },
+  "proactive_split_min_sec": {
+    "type": "float",
+    "default": 1.5,
+    "description": "分段最小间隔（秒）"
+  },
+  "proactive_split_max_sec": {
+    "type": "float",
+    "default": 3.5,
+    "description": "分段最大间隔（秒）"
+  },
+  "proactive_include_bot": {
+    "type": "bool",
+    "default": true,
+    "description": "主动消息参考 bot 自己说过的话"
+  },
+  "proactive_prompt_private": {
+    "type": "text",
+    "default": "",
+    "description": "私聊主动消息提示词（支持占位符）"
+  },
+  "proactive_prompt_group": {
+    "type": "text",
+    "default": "",
+    "description": "群聊主动消息提示词（支持占位符）"
+  },
+  "qzone_post_image_enabled": {
+    "type": "bool",
+    "default": true,
+    "description": "说说配图：从 images/ 随机挑一张"
+  },
+  "qzone_post_image_rate": {
+    "type": "int",
+    "default": 60,
+    "description": "说说带图概率（%）"
+  },
+  "qzone_post_image_source": {
+    "type": "string",
+    "default": "auto",
+    "description": "配图来源：auto/chat/local"
+  },
+  "qzone_post_image_chat_enabled": {
+    "type": "bool",
+    "default": true,
+    "description": "允许使用聊天里收到的图片"
+  },
+  "qzone_post_image_chat_hours": {
+    "type": "int",
+    "default": 24,
+    "description": "聊天图片只挑最近多少小时内的"
+  }
+}

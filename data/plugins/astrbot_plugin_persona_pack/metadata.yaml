@@ -1,0 +1,16 @@
+name: persona_pack
+display_name: 人设包（热切换）
+short_desc: 文件即人设：改 md 保存即生效，支持按群绑定、历史快照与回滚
+desc: >-
+  把 personas/*.md 作为角色设定注入系统提示词。支持：
+  1) 改文件保存即生效（按 mtime 热重载，无需重启）；
+  2) 每个群/私聊可绑定不同人设（/persona use）；
+  3) 每次内容变化自动留快照（personas/.history/），可 /persona rollback 回滚；
+  4) 适配调优：换人设不动代码，方便 A/B 对比。
+version: 0.1.0
+author: dsh-agent
+astrbot_version: ">=4.0.0"
+tags:
+  - 人设
+  - 提示词
+  - 热重载
